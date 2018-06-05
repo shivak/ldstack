@@ -2,14 +2,15 @@
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/shape_inference.h"
 #include "../../linear_recurrence.h"
+#include <cuComplex.h>
 
 using namespace tensorflow;
 
 REGISTER_OP("LinearRecurrence")
-    .Input("decays: float")
-    .Input("impulses: float")
-    .Input("initial_state: float")
-    .Output("response: float")
+    .Input("decays: complex64")
+    .Input("impulses: complex64")
+    .Input("initial_state: complex64")
+    .Output("response: complex64")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext *c) {
         c->set_output(0, c->input(1));
         return Status::OK();
@@ -47,13 +48,20 @@ public:
     Tensor *response_tensor = NULL;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, impulses_tensor.shape(), &response_tensor));
 
-    auto decays = decays_tensor.flat<float>();
-    auto impulses = impulses_tensor.flat<float>();
-    auto initial_state = initial_state_tensor.flat<float>();
-    auto response = response_tensor->template flat<float>();
+    auto decays = decays_tensor.flat<std::complex<float>>().data();
+    auto impulses = impulses_tensor.flat<std::complex<float>>().data();
+    auto initial_state = initial_state_tensor.flat<std::complex<float>>().data();
+    auto response = response_tensor->template flat<std::complex<float>>().data();
 
-    compute_linear_recurrence(decays.data(), impulses.data(),
-			      initial_state.data(), response.data(),
+    /* Layout purposefully matches, so this isn't just wishful thinking */
+    cuComplex *cu_decays = (cuComplex*) decays;
+    cuComplex *cu_impulses = (cuComplex*) impulses;
+    cuComplex *cu_initial_state = (cuComplex*) initial_state;
+    cuComplex *cu_response = (cuComplex*) response;
+
+
+    compute_linear_recurrence(cu_decays, cu_impulses,
+			      cu_initial_state, cu_response,
 			      n_dims, n_steps);
   }
 };

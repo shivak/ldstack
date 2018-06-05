@@ -1,7 +1,11 @@
 #include <assert.h>
 #include <stdio.h>
+#include <cuComplex.h>
 
 #define CEIL_DIV(x, y) ((x + y - 1) / y)
+
+#define cu_complex(c) (make_cuComplex(c.real(), c.imag()))
+#define std_complex(c) (cuComplex(c.x, c.y))
 
 #define gpuErrChk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 void gpuAssert(cudaError_t code, const char *file, int line) {
@@ -9,6 +13,7 @@ void gpuAssert(cudaError_t code, const char *file, int line) {
     fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
   }
 }
+
 
 __device__ int2 divide_work(int n_jobs, int n_workers, int worker_idx) {
   // Each worker will do a continuous slice of either n_jobs / n_workers
@@ -52,15 +57,15 @@ __device__ int2 compute_warp_start_stop(int block_idx, int warp_idx,
 
 // decay storage, h_storage:
 //   each a n_dims x 33 x n_blocks matrix on GPU with 33rd column for block reduction
-__global__ void reduction_kernel(float *decays, float *impulses,
-				 float *initial_state,
-				 float *_decay_storage, float *_h_storage,
+__global__ void reduction_kernel(cuComplex *decays, cuComplex *impulses,
+				 cuComplex *initial_state,
+				 cuComplex *_decay_storage, cuComplex *_h_storage,
 				 int n_dims, int n_steps) {
   int warp = threadIdx.x / 32;
   int lane = threadIdx.x % 32;
 
-  float *decay_storage = &_decay_storage[blockIdx.x * 33 * n_dims];
-  float *h_storage = &_h_storage[blockIdx.x * 33 * n_dims];
+  cuComplex *decay_storage = &_decay_storage[blockIdx.x * 33 * n_dims];
+  cuComplex *h_storage = &_h_storage[blockIdx.x * 33 * n_dims];
 
   int2 start_stop = compute_warp_start_stop(blockIdx.x, warp, gridDim.x, n_steps);
   int warp_start = start_stop.x;
@@ -73,15 +78,15 @@ __global__ void reduction_kernel(float *decays, float *impulses,
   * (feature_idx, warp, block).
   */
   for (int i = lane; i < n_dims; i += 32) {
-    float cum_decay = 1.0;
-    float h = 0.0;
+    cuComplex cum_decay = make_cuComplex(1.0, 0.0);
+    cuComplex h = make_cuComplex(0.0, 0.0);
     if (blockIdx.x == 0 && warp == 0 && initial_state != NULL) {
       h = initial_state[i];
     }
 
     for (int t = warp_start; t < warp_stop; t++) {
-      cum_decay *= decays[i + t * n_dims];
-      h = decays[i + t * n_dims] * h + impulses[i + t * n_dims];
+      cum_decay = cuCmulf(cum_decay, decays[i + t * n_dims]);
+      h = cuCfmaf(decays[i + t * n_dims], h, impulses[i + t * n_dims]);
     }
 
     // TODO: store into shared memory, work in shared memory sized blocks
@@ -101,18 +106,18 @@ __global__ void reduction_kernel(float *decays, float *impulses,
   // TODO: parallel reduction (or scan). Need to worry about changing the warp
   //       reduction values (as I use them again later)
   for (int i = lane + 32 * warp; i < n_dims; i += blockDim.x) {
-    float cum_decay = 1.0;
-    float h = 0.0;
+    cuComplex cum_decay = make_cuComplex(1.0, 0.0);
+    cuComplex h = make_cuComplex(0.0, 0.0);
     for (int t = 0; t < 32; t++) {
-      cum_decay *= decay_storage[i + t * n_dims];
-      h = decay_storage[i + t * n_dims] * h + h_storage[i + t * n_dims];
+      cum_decay = cuCmulf(cum_decay, decay_storage[i + t * n_dims]);
+      h = cuCfmaf(decay_storage[i + t * n_dims], h, h_storage[i + t * n_dims]);
     }
     decay_storage[i + 32 * n_dims] = cum_decay;
     h_storage[i + 32 * n_dims] = h;
   }
 }
 
-__global__ void block_scan_kernel(float *decay_storage, float *h_storage,
+__global__ void block_scan_kernel(cuComplex *decay_storage, cuComplex *h_storage,
 				  int n_dims, int n_blocks) {
   /*
    * Scan over blocks.
@@ -131,15 +136,15 @@ __global__ void block_scan_kernel(float *decay_storage, float *h_storage,
       int prev_idx = i + 32 * n_dims + (t - 1) * 33 * n_dims;
 
       // TODO: remove unneccessary reads from global memory (prev_idx accesses)
-      h_storage[cur_idx] = decay_storage[cur_idx] * h_storage[prev_idx] + h_storage[cur_idx];
-      decay_storage[cur_idx] *= decay_storage[prev_idx];
+      h_storage[cur_idx] = cuCfmaf(decay_storage[cur_idx], h_storage[prev_idx], h_storage[cur_idx]);
+      decay_storage[cur_idx] = cuCmulf(decay_storage[cur_idx], decay_storage[prev_idx]);
     }
   }
 }
 
-__global__ void warp_scan_kernel(float *decays, float *impulses,
-				 float *initial_state, float *out,
-				 float *decay_storage, float *h_storage,
+__global__ void warp_scan_kernel(cuComplex *decays, cuComplex *impulses,
+				 cuComplex *initial_state, cuComplex *out,
+				 cuComplex *decay_storage, cuComplex *h_storage,
 				 int n_dims, int n_steps) {
   int warp = threadIdx.x / 32;
   int lane = threadIdx.x % 32;
@@ -171,8 +176,8 @@ __global__ void warp_scan_kernel(float *decays, float *impulses,
 
       int cur_idx = i + t * n_dims + blockIdx.x * 33 * n_dims;
       int prev_idx = i + (t - 1) * n_dims + blockIdx.x * 33 * n_dims;
-      h_storage[cur_idx] = decay_storage[cur_idx] * h_storage[prev_idx] + h_storage[cur_idx];
-      decay_storage[cur_idx] *= decay_storage[prev_idx];
+      h_storage[cur_idx] = cuCfmaf(decay_storage[cur_idx], h_storage[prev_idx], h_storage[cur_idx]);
+      decay_storage[cur_idx] = cuCmulf(decay_storage[cur_idx], decay_storage[prev_idx]);
     }
   }
 
@@ -189,7 +194,7 @@ __global__ void warp_scan_kernel(float *decays, float *impulses,
    * to output for indices warp_start up to warp_stop.
    */
   for (int i = lane; i < n_dims; i += 32) {
-    float h = 0.0;
+    cuComplex h = make_cuComplex(0.0, 0.0);
     if (blockIdx.x == 0 && warp == 0) {
       if (initial_state != NULL) {
 	h = initial_state[i];
@@ -199,25 +204,25 @@ __global__ void warp_scan_kernel(float *decays, float *impulses,
     }
 
     for (int t = warp_start; t < warp_stop; t++) {
-      h = decays[i + t * n_dims] * h + impulses[i + t * n_dims];
+      h = cuCfmaf(decays[i + t * n_dims], h, impulses[i + t * n_dims]);
       out[i + t * n_dims] = h;
     }
   }
 }
 
-__global__ void serial_linear_recurrence(float *decays, float *impulses,
-                                         float *initial_state, float *out,
+__global__ void serial_linear_recurrence(cuComplex *decays, cuComplex *impulses,
+                                         cuComplex *initial_state, cuComplex *out,
                                          int n_dims, int n_steps) {
   // computes h_t = lambda_t h{t-1} + x_t
 
   for (int dim_idx = threadIdx.x + blockIdx.x * blockDim.x;
        dim_idx < n_dims;
        dim_idx += blockDim.x * gridDim.x) {
-    float val = initial_state[dim_idx];
+    cuComplex val = initial_state[dim_idx];
 
     for (int step = 0; step < n_steps; step++) {
       int idx = dim_idx + step * n_dims;
-      val = decays[idx] * val + impulses[idx];
+      val = cuCfmaf(decays[idx], val, impulses[idx]);
       out[idx] = val;
     }
   }
@@ -231,8 +236,8 @@ extern "C" {
  * initial_state:
  *   array of size n_dims located on GPU
  */
-void compute_linear_recurrence(float *decays, float *impulses, float *initial_state,
-			       float *out, int n_dims, int n_steps) {
+void compute_linear_recurrence(cuComplex *decays, cuComplex *impulses, cuComplex *initial_state,
+			       cuComplex *out, int n_dims, int n_steps) {
 
   // TODO: query
   int n_SMs = 15;
@@ -244,11 +249,11 @@ void compute_linear_recurrence(float *decays, float *impulses, float *initial_st
 
   // TODO: make user pass in working memory? This allows integration
   //       with CNMeM (used by Theano)
-  int reduction_mem_sz = 2 * n_blocks * 33 * n_dims * sizeof(float);
-  float *d_reduction_mem;
+  int reduction_mem_sz = 2 * n_blocks * 33 * n_dims * sizeof(cuComplex);
+  cuComplex *d_reduction_mem;
   gpuErrChk(cudaMalloc(&d_reduction_mem, reduction_mem_sz));
-  float *d_decay_storage = &d_reduction_mem[0 * n_blocks * 33 * n_dims];
-  float *d_h_storage = &d_reduction_mem[1 * n_blocks * 33 * n_dims];
+  cuComplex *d_decay_storage = &d_reduction_mem[0 * n_blocks * 33 * n_dims];
+  cuComplex *d_h_storage = &d_reduction_mem[1 * n_blocks * 33 * n_dims];
 
   // TODO: run kernels on non-default stream?
   reduction_kernel<<<n_blocks, 1024>>>(decays, impulses, initial_state,
@@ -266,8 +271,8 @@ void compute_linear_recurrence(float *decays, float *impulses, float *initial_st
   gpuErrChk(cudaFree(d_reduction_mem));
 }
 
-void compute_serial_linear_recurrence(float *decays, float *impulses,
-                                      float *initial_state, float *out,
+void compute_serial_linear_recurrence(cuComplex *decays, cuComplex *impulses,
+                                      cuComplex *initial_state, cuComplex *out,
                                       int n_dims, int n_steps) {
   // TODO: query
   int n_SMs = 15;
@@ -284,31 +289,31 @@ void test() {
   int n_steps = 1000000;
   int n_elements = n_dims * n_steps;
 
-  float *decays = (float *) calloc(n_elements, sizeof(float));
+  cuComplex *decays = (cuComplex*) calloc(n_elements, sizeof(cuComplex));
   for (int i = 0; i < n_elements; i++) {
-    decays[i] = .999;
+    decays[i] = make_cuComplex(.999, .001);
   }
-  float *d_decays;
-  gpuErrChk(cudaMalloc(&d_decays, n_elements * sizeof(float)));
-  gpuErrChk(cudaMemcpy(d_decays, decays, n_elements * sizeof(float),
+  cuComplex *d_decays;
+  gpuErrChk(cudaMalloc(&d_decays, n_elements * sizeof(cuComplex)));
+  gpuErrChk(cudaMemcpy(d_decays, decays, n_elements * sizeof(cuComplex),
 		       cudaMemcpyHostToDevice));
 
-  float *impulses = (float *) calloc(n_elements, sizeof(float));
+  cuComplex *impulses = (cuComplex*) calloc(n_elements, sizeof(cuComplex));
   for (int i = 0; i < n_dims; i++) {
-    impulses[i + 0 * n_dims] = 2.0;
+    impulses[i + 0 * n_dims] = make_cuComplex(2.0, 0.5);
   }
-  float *d_impulses;
-  gpuErrChk(cudaMalloc(&d_impulses, n_elements * sizeof(float)));
+  cuComplex *d_impulses;
+  gpuErrChk(cudaMalloc(&d_impulses, n_elements * sizeof(cuComplex)));
   gpuErrChk(cudaMemcpy(d_impulses, impulses,
-		       n_elements * sizeof(float), cudaMemcpyHostToDevice));
+		       n_elements * sizeof(cuComplex), cudaMemcpyHostToDevice));
 
-  float *out = (float *) calloc(n_elements, sizeof(float));
-  float *d_out;
-  gpuErrChk(cudaMalloc(&d_out, n_elements * sizeof(float)));
-  gpuErrChk(cudaMemset(d_out, 0, n_elements * sizeof(float)));
+  cuComplex *out = (cuComplex*) calloc(n_elements, sizeof(cuComplex));
+  cuComplex *d_out;
+  gpuErrChk(cudaMalloc(&d_out, n_elements * sizeof(cuComplex)));
+  gpuErrChk(cudaMemset(d_out, 0, n_elements * sizeof(cuComplex)));
 
   compute_linear_recurrence(d_decays, d_impulses, NULL, d_out, n_dims, n_steps);
-  gpuErrChk(cudaMemcpy(out, d_out, n_elements * sizeof(float),
+  gpuErrChk(cudaMemcpy(out, d_out, n_elements * sizeof(cuComplex),
 		       cudaMemcpyDeviceToHost));
 
   gpuErrChk(cudaFree(d_decays));
