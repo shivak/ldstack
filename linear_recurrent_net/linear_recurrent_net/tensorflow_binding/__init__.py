@@ -39,8 +39,8 @@ def _linear_recurrence_grad(op, dl_dresp):
     n_steps = tf.shape(impulses)[0]
 
     # forwards goes from h_0 to h_{T-1}
-    forwards_tail = linear_recurrence(decays, impulses, initial_state)[:-1, :]
-    forwards = tf.concat([tf.expand_dims(initial_state, 0), forwards_tail],
+    forwards_tail = linear_recurrence(tf.conj(decays), tf.conj(impulses), tf.conj(initial_state))[:-1, :]
+    forwards = tf.concat([tf.expand_dims(tf.conj(initial_state), 0), forwards_tail],
                          axis=0)
 
     reverse = lambda x: tf.reverse(x, axis=[0])
@@ -50,7 +50,7 @@ def _linear_recurrence_grad(op, dl_dresp):
     # output gradients from T-1, T-2, ..., 1
     dl_dh_head = reverse(
         linear_recurrence(
-            reverse(decays)[:-1, :],
+            tf.conj(reverse(decays)[:-1, :]),
             reverse(dl_dresp)[1:, :],
             dl_dresp[-1, :],
         )
@@ -58,8 +58,23 @@ def _linear_recurrence_grad(op, dl_dresp):
 
     dl_dh = tf.concat([dl_dh_head, dl_dresp[-1:, :]], axis=0)
 
-    dl_dinit = decays[0, :] * dl_dh[0, :]
+    dl_dinit = tf.conj(decays[0, :]) * dl_dh[0, :]
     dl_dimpulses = dl_dh
     dl_ddecays = dl_dh * forwards
 
     return [dl_ddecays, dl_dimpulses, dl_dinit]
+
+def linear_recurrence_cpu(f, b, h0=0.0):
+    """Compute the linear recurrence using native tf operations
+    so that we evaluate without a GPU. We evaluate the recurrence
+    which is stepwise h_t = f * h_{t-1} + b, returning all h."""
+    fs = tf.unstack(f, axis=0)
+    bs = tf.unstack(b, axis=0)
+    h = tf.identity(b)
+
+    hs = []
+    for index in range(len(bs)):
+#        print fs[index], bs[index]
+        to_append = tf.add(tf.multiply(fs[index], (hs[index-1] if index > 0 else h0)), bs[index])
+        hs.append(to_append)
+    return tf.stack(hs)

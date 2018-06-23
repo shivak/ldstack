@@ -1,5 +1,5 @@
 import tensorflow as tf
-from linear_recurrent_net.tensorflow_binding import linear_recurrence
+from linear_recurrent_net.tensorflow_binding import linear_recurrence, linear_recurrence_cpu
 
 def vscope(name):
     return tf.variable_scope(None, default_name=name)
@@ -220,19 +220,4 @@ def gilr_layer_cpu(X, hidden_size, nonlin=tf.nn.elu,
         gate = tf.sigmoid(gate)
         impulse = nonlin(impulse)
         return s_linear_recurrence_cpu(gate, (1-gate) * impulse)
-
-def linear_recurrence_cpu(f, b):
-    """Compute the linear recurrence using native tf operations
-    so that we evaluate without a GPU. We evaluate the recurrence
-    which is stepwise h_t = f * h_{t-1} + b, returning all h."""
-    fs = tf.unstack(f, axis=0)
-    bs = tf.unstack(b, axis=0)
-    h = tf.identity(b)
-
-    hs = [bs[0]]
-    for index in range(1, len(bs)):
-        print fs[index], bs[index]
-        to_append = tf.add(tf.multiply(fs[index], hs[index-1]), bs[index])
-        hs.append(to_append)
-    return tf.stack(hs)
 
