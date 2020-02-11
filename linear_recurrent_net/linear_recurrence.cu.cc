@@ -1,6 +1,9 @@
 #include <assert.h>
 #include <stdio.h>
 #include <cuComplex.h>
+#define EIGEN_USE_GPU
+//#include "tensorflow/core/util/gpu_kernel_helper.h"
+#include "tensorflow/core/util/cuda_kernel_helper.h"
 
 #define CEIL_DIV(x, y) ((x + y - 1) / y)
 
@@ -236,8 +239,7 @@ extern "C" {
  * initial_state:
  *   array of size n_dims located on GPU
  */
-void compute_linear_recurrence(cuComplex *decays, cuComplex *impulses, cuComplex *initial_state,
-			       cuComplex *out, int n_dims, int n_steps) {
+void compute_linear_recurrence(cuComplex *decays, cuComplex *impulses, cuComplex *initial_state, cuComplex *out, int n_dims, int n_steps) {
 
   // TODO: query
   int n_SMs = 15;
@@ -284,7 +286,7 @@ void compute_serial_linear_recurrence(cuComplex *decays, cuComplex *impulses,
 }
 }
 
-void test() {
+/* void test() {
   int n_dims = 100;
   int n_steps = 1000000;
   int n_elements = n_dims * n_steps;
@@ -312,11 +314,11 @@ void test() {
   gpuErrChk(cudaMalloc(&d_out, n_elements * sizeof(cuComplex)));
   gpuErrChk(cudaMemset(d_out, 0, n_elements * sizeof(cuComplex)));
 
-  compute_linear_recurrence(d_decays, d_impulses, NULL, d_out, n_dims, n_steps);
+  compute_linear_recurrence(d_decays, d_impulses, NULL, d_out, n_dims, n_steps, d);
   gpuErrChk(cudaMemcpy(out, d_out, n_elements * sizeof(cuComplex),
 		       cudaMemcpyDeviceToHost));
 
   gpuErrChk(cudaFree(d_decays));
   gpuErrChk(cudaFree(d_impulses));
   gpuErrChk(cudaFree(d_out));
-}
+}*/

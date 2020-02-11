@@ -51,7 +51,7 @@ public:
     auto decays = decays_tensor.flat<std::complex<float>>().data();
     auto impulses = impulses_tensor.flat<std::complex<float>>().data();
     auto initial_state = initial_state_tensor.flat<std::complex<float>>().data();
-    auto response = response_tensor->template flat<std::complex<float>>().data();
+    auto response = response_tensor->flat<std::complex<float>>().data();
 
     /* Layout purposefully matches, so this isn't just wishful thinking */
     cuComplex *cu_decays = (cuComplex*) decays;
@@ -59,10 +59,9 @@ public:
     cuComplex *cu_initial_state = (cuComplex*) initial_state;
     cuComplex *cu_response = (cuComplex*) response;
 
-
     compute_linear_recurrence(cu_decays, cu_impulses,
 			      cu_initial_state, cu_response,
-			      n_dims, n_steps);
+			      n_dims, n_steps);//, ctx->eigen_device<Eigen::GpuDevice>());
   }
 };
 REGISTER_KERNEL_BUILDER(Name("LinearRecurrence").Device(DEVICE_GPU), GpuLinearRecurrenceOp);

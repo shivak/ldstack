@@ -49,7 +49,8 @@ def run_test(linear_recurrence, sess):
                                         response, impulses.shape)
     )
 
-with tf.Session() as sess:
+if __name__ == "__main__":
+  with tf.Session() as sess:
     print("GPU")
     run_test(linear_recurrence, sess)
     print("CPU")
