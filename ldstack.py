@@ -1,4 +1,4 @@
-def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None):
+def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None, Dₒ_init=None):
   # Initialization as roots of random coefficient polynomial
   if λ_init is None:
     λ_init = np.zeros((k,n), dtype=np.complex64)
@@ -23,10 +23,28 @@ def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None):
             
     lnλ_comp_a = tf.get_variable("ln_eig_comp_a", dtype=tf.float32, initializer=tf.constant(lnλ_comp_init_a), trainable=True)
     lnλ_comp_b = tf.get_variable("ln_eig_comp_b", dtype=tf.float32, initializer=tf.constant(lnλ_comp_init_b), trainable=True)
-    lnλ_comp_r = tf.concat([lnλ_comp_a, lnλ_comp_a], axis=0)
-    lnλ_comp_i = tf.concat([lnλ_comp_b, -1*lnλ_comp_b], axis=0)
+    # Keep conjugate pairs adjacent [-b_1, b_1, -b_2, b_2, ...]
+    # tf.repeat() not in 1.13
+    lnλ_comp_r = tf.keras.backend.repeat_elements(lnλ_comp_a, 2, axis=0)
+    lnλ_comp_i = tf.keras.backend.repeat_elements(lnλ_comp_b, 2, axis=0) * np.tile([-1,1], lnλ_comp_init_b.shape[0])
     lnλ_comp = tf.complex(lnλ_comp_r, lnλ_comp_i)
-    lnλ = tf.concat([lnλ_real, lnλ_comp], axis=0)
+    # restore original order of eigenvalues
+    # TF BUG in scatter_nd() seems to mangle complex values 
+    if False:
+      lnλ = tf.scatter_nd(
+              np.concatenate((np.argwhere(np.isreal(λ_init)), np.argwhere(np.iscomplex(λ_init)))),
+              tf.concat([lnλ_real, lnλ_comp], axis=0),
+              [k*n])    
+    else:
+      lnλ_r = tf.scatter_nd(
+                np.concatenate((np.argwhere(np.isreal(λ_init)), np.argwhere(np.iscomplex(λ_init)))),
+                tf.real(tf.concat([lnλ_real, lnλ_comp], axis=0)),
+                [k*n]) 
+      lnλ_i = tf.scatter_nd(
+                np.concatenate((np.argwhere(np.isreal(λ_init)), np.argwhere(np.iscomplex(λ_init)))),
+                tf.imag(tf.concat([lnλ_real, lnλ_comp], axis=0)),
+                [k*n]) 
+      lnλ = tf.complex(lnλ_r, lnλ_i)
     lnλ = tf.reshape(lnλ, [k,n], name="ln_eig")
     
     if C_init is None:
@@ -34,8 +52,11 @@ def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None):
     C = tf.get_variable("C", dtype=tf.float32, initializer=tf.constant(C_init), trainable=True)
     if D_init is None:
       D_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[k,m]).astype(np.float32)
-    D = tf.get_variable("D", dtype=tf.float32, initializer=tf.constant(D_init), trainable=True)    
-    return (lnλ, C, D), (λ_init, C_init, D_init) 
+    D = tf.get_variable("D", dtype=tf.float32, initializer=tf.constant(D_init), trainable=True)
+    if Dₒ_init is None:
+      Dₒ_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[m]).astype(np.float32)
+    Dₒ = tf.get_variable("D0", dtype=tf.float32, initializer=tf.constant(Dₒ_init), trainable=True)    
+    return (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) 
 
 # x : [T, b, k]
 # λ : [k, n]
@@ -51,7 +72,7 @@ def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None):
 # currently with sʹ_0 = 0
 # y : [T, b, k, m] is:
 #     y_t  = Cʹsʹ_t + Dx_t
-def batch_simo_lds(x, lnλ, C, D, α=None, standard=False):
+def batch_simo_lds(x, lnλ, C, D, Dₒ, α=None, standard=False):
   k = x.shape[2]
   n = tf.shape(lnλ)[1]
   b = x.shape[1]
@@ -107,7 +128,7 @@ def batch_simo_lds(x, lnλ, C, D, α=None, standard=False):
   
   Cʹ·sʹ = tf.real(tf.reduce_sum(tf.expand_dims(sʹ, -1)*tf.reshape(Cʹ, (1,1,k,n,m)), axis=-2))
   D·x = tf.real(tf.expand_dims(x, -1)) * tf.reshape(D, (1,1,k,m))
-  y = Cʹ·sʹ + D·x
+  y = Cʹ·sʹ + D·x + Dₒ
 
   return sʹ, y
 
@@ -118,7 +139,7 @@ def recipsq(a):
 #       And actually, is faster for GPU computation, and should be the standard for RNNs.)
 # returns [T, batch_size, m] and params
 # see batch_simo_lds for meaning of standard
-def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, standard=False):
+def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, Dₒ_init=None, standard=True):
   with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
     T, b, d = x.shape
 
@@ -127,7 +148,7 @@ def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, stand
       R = tf.cast(R, tf.complex64)
       x = tf.tensordot(x, R, [[-1], [0]])
     
-    (lnλ, C, D), (λ_init, C_init, D_init) = ldstack_vars(m, n, k, "lds", λ_init, C_init, D_init)
+    (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) = ldstack_vars(m, n, k, "lds", λ_init, C_init, D_init, Dₒ_init)
     λ = tf.exp(lnλ)
     # λ : [k, n]
     # C : [k, m, n]
@@ -136,9 +157,9 @@ def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, stand
     # y : [T, b, k, m]
     α = None
     for i in np.arange(Δ):
-      sʹ, y = batch_simo_lds(x, lnλ, C, D, α, standard)
+      sʹ, y = batch_simo_lds(x, lnλ, C, D, Dₒ, α, standard)
       λ·sʹ = tf.reshape(λ, (1,1,k,n)) * sʹ
       α = recipsq(λ·sʹ)
 
     y = tf.reduce_mean(y, axis=2)
-    return y, (lnλ, C, D), (λ_init, C_init, D_init)
+    return y, (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init)
