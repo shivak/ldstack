@@ -1,8 +1,4 @@
-import numpy as np
-import tensorflow as tf
-from linear_recurrent_net.linear_recurrent_net.tensorflow_binding import linear_recurrence
-
-def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None):
+def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None):
   # Initialization as roots of random coefficient polynomial
   if λ_init is None:
     λ_init = np.zeros((k,n), dtype=np.complex64)
@@ -33,20 +29,29 @@ def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None):
     lnλ = tf.concat([lnλ_real, lnλ_comp], axis=0)
     lnλ = tf.reshape(lnλ, [k,n], name="ln_eig")
     
-
     if C_init is None:
       C_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[k,m,n]).astype(np.float32)
     C = tf.get_variable("C", dtype=tf.float32, initializer=tf.constant(C_init), trainable=True)
-    return lnλ, C, λ_init, C_init 
+    if D_init is None:
+      D_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[k,m]).astype(np.float32)
+    D = tf.get_variable("D", dtype=tf.float32, initializer=tf.constant(D_init), trainable=True)    
+    return (lnλ, C, D), (λ_init, C_init, D_init) 
 
 # x : [T, b, k]
 # λ : [k, n]
 # C : [k, m, n]
-# α : [T, b, k, n]
-# Returns:
-# sʹ: [T, b, k, n]
-# y : [T, b, k, m]
-def batch_simo_lds(x, lnλ, C, α=None):
+# D : [k, m]
+# α : [T, b, k, n] is:
+#      α_0, ..., α_{T-1} (in "standard" mode)
+#      α_1, ..., α_T     (otherwise)
+# Returns (for t in [1,...,T]):
+# sʹ: [T, b, k, n] is:
+#     sʹ_t = α_{t-1}·λ·sʹ_{t-1}  + Bx_{t-1}   (in "standard" mode)
+#     sʹ_t = α_t    ·λ·sʹ_{t-1}  + Bx_t       (otherwise)
+# currently with sʹ_0 = 0
+# y : [T, b, k, m] is:
+#     y_t  = Cʹsʹ_t + Dx_t
+def batch_simo_lds(x, lnλ, C, D, α=None, standard=False):
   k = x.shape[2]
   n = tf.shape(lnλ)[1]
   b = x.shape[1]
@@ -65,10 +70,10 @@ def batch_simo_lds(x, lnλ, C, α=None):
   # = -∑_{i≠j} log(1 - λj/λi)
   # = -∑_j log(1 - ratios[k,j,i]) 
   # because log(1 - ratios[k,i,i]) = 0
-  log_Bʹ = -1* tf.reduce_sum(tf.log(1.0 - ratios), axis=1)
+  lnBʹ = -1* tf.reduce_sum(tf.log(1.0 - ratios), axis=1)
   # Bʹ : [k, n]
   # Bʹ·x : [T, b, k*n]
-  Bʹ = tf.exp(log_Bʹ)
+  Bʹ = tf.exp(lnBʹ)
   Bʹ·x = tf.reshape(tf.expand_dims(x, -1)*Bʹ, (T, b, k*n))
 
   # α·λ : [T, b, k*n]
@@ -78,6 +83,12 @@ def batch_simo_lds(x, lnλ, C, α=None):
   else:
     α·λ = α*tf.reshape(λ, (1, 1, k, n))  
     α·λ = tf.reshape(α·λ, (T, b, k*n))
+  # linear_recurrence computes sʹ_t = α_t·λ·sʹ_{t-1} + Bx_t
+  # for standard LDS, we need to shift α and x
+  # sʹ_t = α_{t-1}·λ·sʹ_{t-1} + Bx_{t-1}
+  if standard:
+    α·λ  = tf.concat([tf.zeros((1,b,k*n), dtype=tf.complex64),  α·λ[:-1]], axis=0)
+    Bʹ·x = tf.concat([tf.zeros((1,b,k*n), dtype=tf.complex64),  Bʹ·x[:-1]], axis=0)
   sʹ = linear_recurrence(α·λ, Bʹ·x)
   sʹ = tf.reshape(sʹ, [T, b, k, n])
     
@@ -94,8 +105,10 @@ def batch_simo_lds(x, lnλ, C, α=None):
   Cʹ = tf.reduce_sum(tf.exp(sum_logs), axis=-2) # [m, k, n]
   Cʹ = tf.transpose(Cʹ, (1,2,0)) # [k, n, m]
   
-  y = tf.real(tf.reduce_sum(tf.expand_dims(sʹ, -1)*tf.reshape(Cʹ, (1,1,k,n,m)), axis=-2))
-  #y = tf.real(tf.tensordot(sʹ, Cʹ, [[-1], [1]]))
+  Cʹ·sʹ = tf.real(tf.reduce_sum(tf.expand_dims(sʹ, -1)*tf.reshape(Cʹ, (1,1,k,n,m)), axis=-2))
+  D·x = tf.real(tf.expand_dims(x, -1)) * tf.reshape(D, (1,1,k,m))
+  y = Cʹ·sʹ + D·x
+
   return sʹ, y
 
 def recipsq(a):
@@ -104,8 +117,8 @@ def recipsq(a):
 # x: [T, batch_size, d] is complex (this is unusual, but matches the format of linear_recurrence.
 #       And actually, is faster for GPU computation, and should be the standard for RNNs.)
 # returns [T, batch_size, m] and params
-# NOTE: does *not* return output corresponding to initial state, so make sure to shift target to y[1:] and output to y[:-1] in loss
-def ldstack(x, n, m, k, D, scope, λ_init=None, C_init=None):
+# see batch_simo_lds for meaning of standard
+def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, standard=False):
   with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
     T, b, d = x.shape
 
@@ -114,7 +127,7 @@ def ldstack(x, n, m, k, D, scope, λ_init=None, C_init=None):
       R = tf.cast(R, tf.complex64)
       x = tf.tensordot(x, R, [[-1], [0]])
     
-    lnλ, C, λ_init, C_init = ldstack_vars(m, n, k, "lds", λ_init=λ_init, C_init=C_init)
+    (lnλ, C, D), (λ_init, C_init, D_init) = ldstack_vars(m, n, k, "lds", λ_init, C_init, D_init)
     λ = tf.exp(lnλ)
     # λ : [k, n]
     # C : [k, m, n]
@@ -122,10 +135,10 @@ def ldstack(x, n, m, k, D, scope, λ_init=None, C_init=None):
     # sʹ: [T, b, k, n]
     # y : [T, b, k, m]
     α = None
-    for i in np.arange(D):
-      sʹ, y = batch_simo_lds(x, lnλ, C, α)
+    for i in np.arange(Δ):
+      sʹ, y = batch_simo_lds(x, lnλ, C, D, α, standard)
       λ·sʹ = tf.reshape(λ, (1,1,k,n)) * sʹ
       α = recipsq(λ·sʹ)
 
     y = tf.reduce_mean(y, axis=2)
-    return y, (lnλ, C), (λ_init, C_init)
+    return y, (lnλ, C, D), (λ_init, C_init, D_init)
