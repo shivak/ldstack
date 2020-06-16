@@ -1,3 +1,7 @@
+import numpy as np
+import tensorflow as tf
+from linear_recurrent_net.linear_recurrent_net.tensorflow_binding import linear_recurrence
+
 def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None, Dₒ_init=None):
   # Initialization as roots of random coefficient polynomial
   if λ_init is None:
