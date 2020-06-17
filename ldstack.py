@@ -2,8 +2,37 @@ import numpy as np
 import tensorflow as tf
 from linear_recurrent_net.linear_recurrent_net.tensorflow_binding import linear_recurrence
 
+# Initialize with uniformly random complex eigenvalues of magnitude 1.
+# If λ has polar coordinates (r, θ) then ln(λ) = ln r + θi
+# Also, ln(λ*) = ln r - θi
+# Fix r=1, i.e. ln r = 0. (For numerical reasons, can fix r=1-𝛿 for some small 𝛿) 
+# Note this only requires n/2 parameters rather than n
+def unitary_ldstack_vars(m, n, k, scope):
+  with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+    if n % 2 != 0:
+      raise "n must be even"
+
+    half_n = round(n/2)
+    θ_init = np.random.uniform(low=-np.pi, high=np.pi, size=[k,half_n]).astype(np.float32)
+    θ = tf.get_variable("eig_angle", initializer=tf.constant(θ_init), dtype=tf.float32, trainable=True)
+    lnλ_r = tf.zeros((k,n), dtype=tf.float32)
+    #lnλ_r = np.log(1-𝛿)*tf.ones((k,n), dtype=tf.float32)
+    
+    lnλ_i = tf.concat([θ, -θ], axis=1)
+    lnλ = tf.complex(lnλ_r, lnλ_i)
+    lnλ_init = 0 #FIXME
+
+    C_init = np.random.uniform(low=-0.0001, high=0.0001, size=[k,m,n]).astype(np.float32)
+    C = tf.get_variable("C", dtype=tf.float32, initializer=tf.constant(C_init), trainable=True)
+    D_init = np.random.uniform(low=-0.001, high=0.001, size=[k,m]).astype(np.float32)
+    D = tf.get_variable("D", dtype=tf.float32, initializer=tf.constant(D_init), trainable=True)
+    Dₒ_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[m]).astype(np.float32)
+    Dₒ = tf.get_variable("D0", dtype=tf.float32, initializer=tf.constant(Dₒ_init), trainable=True)    
+    
+    return (lnλ, C, D, Dₒ), (lnλ_init, C_init, D_init, Dₒ_init)
+
+# Initialization as roots of monic polynomial with random coefficients
 def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None, Dₒ_init=None):
-  # Initialization as roots of random coefficient polynomial
   if λ_init is None:
     λ_init = np.zeros((k,n), dtype=np.complex64)
     for i in np.arange(k):
@@ -152,7 +181,8 @@ def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, Dₒ_
       R = tf.cast(R, tf.complex64)
       x = tf.tensordot(x, R, [[-1], [0]])
     
-    (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) = ldstack_vars(m, n, k, "lds", λ_init, C_init, D_init, Dₒ_init)
+    #(lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) = ldstack_vars(m, n, k, "lds", λ_init, C_init, D_init, Dₒ_init)
+    (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) = unitary_ldstack_vars(m, n, k, "lds")
     λ = tf.exp(lnλ)
     # λ : [k, n]
     # C : [k, m, n]
