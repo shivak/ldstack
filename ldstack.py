@@ -3,10 +3,11 @@ import tensorflow as tf
 from linear_recurrent_net.linear_recurrent_net.tensorflow_binding import linear_recurrence
 
 # Initialize with uniformly random complex eigenvalues of magnitude 1.
-# If λ has polar coordinates (r, θ) then ln(λ) = ln r + θi
-# Also, ln(λ*) = ln r - θi
-# Fix r=1, i.e. ln r = 0. (For numerical reasons, can fix r=1-𝛿 for some small 𝛿) 
+# If λ has polar coordinates (r, θ) then ln(λ) = ln(r) + θi
+# Also, ln(λ*) = ln(r) - θi
+# Fix r=1, i.e. ln(r) = 0. (For numerical reasons, can fix r=1-𝛿 for some small 𝛿) 
 # Note this only requires n/2 parameters rather than n
+# Should constrain -π ≤ θ ≤ π
 def unitary_ldstack_vars(m, n, k, scope):
   with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
     if n % 2 != 0:
@@ -89,7 +90,7 @@ def ldstack_vars(m, n, k, scope, λ_init=None, C_init=None, D_init=None, Dₒ_in
     if Dₒ_init is None:
       Dₒ_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[m]).astype(np.float32)
     Dₒ = tf.get_variable("D0", dtype=tf.float32, initializer=tf.constant(Dₒ_init), trainable=True)    
-    return (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) 
+    return (lnλ, C, D, Dₒ), (np.log(λ_init), C_init, D_init, Dₒ_init) 
 
 # x : [T, b, k]
 # λ : [k, n]
@@ -117,6 +118,7 @@ def batch_simo_lds(x, lnλ, C, D, Dₒ, α=None, standard=False):
   ratios = tf.reshape(λ, (k, -1, 1)) / tf.reshape(λ, (k, 1, -1))
   #ratios = tf.exp(tf.reshape(lnλ, (k, -1, 1)) - tf.reshape(lnλ, (k, 1, -1)))
   ratios = tf.linalg.set_diag(ratios, tf.zeros(shape=[k,n], dtype=tf.complex64))
+  
   # Bʹ_i = λi^{n-1} / ∏_{i≠j} λi-λj
   # log Bʹ_i 
   # = (n-1) logλi - ∑_{i≠j} log(λi-λj)
@@ -166,7 +168,7 @@ def batch_simo_lds(x, lnλ, C, D, Dₒ, α=None, standard=False):
   return sʹ, y
 
 def recipsq(a):
-  return tf.math.rsqrt(1 + tf.math.square(a))
+  return tf.complex(tf.math.rsqrt(1 + tf.math.square(tf.abs(a))), 0.0)
 
 # x: [T, batch_size, d] is complex (this is unusual, but matches the format of linear_recurrence.
 #       And actually, is faster for GPU computation, and should be the standard for RNNs.)
@@ -181,8 +183,8 @@ def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, Dₒ_
       R = tf.cast(R, tf.complex64)
       x = tf.tensordot(x, R, [[-1], [0]])
     
-    #(lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) = ldstack_vars(m, n, k, "lds", λ_init, C_init, D_init, Dₒ_init)
-    (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init) = unitary_ldstack_vars(m, n, k, "lds")
+    #(lnλ, C, D, Dₒ), (lnλ_init, C_init, D_init, Dₒ_init) = ldstack_vars(m, n, k, "lds", λ_init, C_init, D_init, Dₒ_init)
+    (lnλ, C, D, Dₒ), (lnλ_init, C_init, D_init, Dₒ_init) = unitary_ldstack_vars(m, n, k, "lds")
     λ = tf.exp(lnλ)
     # λ : [k, n]
     # C : [k, m, n]
@@ -196,4 +198,4 @@ def ldstack(x, n, m, k, Δ, scope, λ_init=None, C_init=None, D_init=None, Dₒ_
       α = recipsq(λ·sʹ)
 
     y = tf.reduce_mean(y, axis=2)
-    return y, (lnλ, C, D, Dₒ), (λ_init, C_init, D_init, Dₒ_init)
+    return y, (lnλ, C, D, Dₒ), (lnλ_init, C_init, D_init, Dₒ_init)
