@@ -18,10 +18,13 @@ print("Total number of batches:", total_batch)
 # Network Parameters
 num_input = 1 # MNIST data input (img shape: 28*28)
 timesteps = 28 * 28 # timesteps
-num_hidden = 100 # hidden layer num of features
+n_lstm = 32
+n_gru = 37
+n_lds = 32
 num_classes = 10 # MNIST total classes (0-9 digits)
-k = 1
-D = 4
+k = 16
+Del = 1
+num_layers = 1
 
 # Doesn't work on CUDNN RNNs because they use an opaque buffer for weights
 # Use count_params() instead
@@ -39,25 +42,27 @@ def num_parameters(scope):
 
 def lds(X, Y, scope):
   with tf.variable_scope(scope):
-    X_cplx = tf.complex(X, 0.0) #[T, batch_size, 1]
-    y, _, _ = ldstack(X_cplx, num_hidden, num_classes, k, D, scope, standard=True)
-    y = y[-1]
-    print(scope + "parameters: ", num_parameters(scope))
-    return trainer(y, Y, scope, COCOB())
+    outs = X
+    for i in np.arange(num_layers):
+      outs = tf.complex(outs, 0.0)
+      outs, (lnlam, _, _, _), (laminit, _, _, _) = ldstack(outs, n_lds, num_classes, (k if i > 0 else k), Del, scope + str(i), standard=True)
+    outs = outs[-1]
+    print(scope + " parameters: ", num_parameters(scope))
+    return trainer(outs, Y, scope, tf.train.AdamOptimizer(0.0001)), (lnlam, laminit)
 def gru(X, Y, scope):
   with tf.variable_scope(scope):
-    g = tf.contrib.cudnn_rnn.CudnnGRU(1, num_hidden, kernel_initializer=tf.orthogonal_initializer())
+    g = tf.contrib.cudnn_rnn.CudnnGRU(1, n_gru, kernel_initializer=tf.orthogonal_initializer())
     outs, _ = g(X)
     outs = outs[-1]
     outs = tf.layers.Dense(num_classes)(outs)
-    return trainer(outs, Y, scope, tf.train.AdamOptimizer(0.001)), g
+    return trainer(outs, Y, scope, tf.train.AdamOptimizer(0.0001)), g
 def lstm(X, Y, scope):
   with tf.variable_scope(scope):
-    g = tf.contrib.cudnn_rnn.CudnnLSTM(1, num_hidden, kernel_initializer=tf.orthogonal_initializer())
+    g = tf.contrib.cudnn_rnn.CudnnLSTM(1, n_lstm, kernel_initializer=tf.orthogonal_initializer())
     outs, _ = g(X)
     outs = outs[-1]
     outs = tf.layers.Dense(num_classes)(outs)
-    return trainer(outs, Y, scope, tf.train.AdamOptimizer(0.001)), g    
+    return trainer(outs, Y, scope, tf.train.AdamOptimizer(0.0001)), g    
 
 def trainer(logits, Y, scope, optimizer):
   prediction = tf.nn.softmax(logits)
@@ -77,9 +82,11 @@ if True:
     X = tf.placeholder("float32", [timesteps, batch_size, 1])
     Y = tf.placeholder("float32", [batch_size, num_classes])
     
+    (lds_train_op, lds_loss, lds_accuracy), (lnlam, laminit) = lds(X, Y, "LDStack")
     (gru_train_op, gru_loss, gru_accuracy), gru_layer = gru(X, Y, "GRU")
     (lstm_train_op, lstm_loss, lstm_accuracy), lstm_layer = lstm(X, Y, "LSTM")
-    lds_train_op, lds_loss, lds_accuracy = lds(X, Y, "LDStack")
+    losses = [lds_loss, gru_loss, lstm_loss]
+    accuracies = [lds_accuracy, gru_accuracy, lstm_accuracy]
 
     init = tf.global_variables_initializer()
 
@@ -112,6 +119,10 @@ display_step = 0
 if True:
     # Run the initializer
     sess.run(init)
+
+    print(np.log(laminit))
+    print(sess.run(lnlam))
+
     for step in range(1, training_steps+1):
         batch_x, batch_y = mnist.train.next_batch(batch_size)
         batch_x = batch_x.reshape((batch_size, timesteps, num_input))
@@ -122,7 +133,6 @@ if True:
         sess.run(lstm_train_op, feed_dict={X: batch_x, Y: batch_y})
 
         if step % display_every == 0 or step == 1:
-          accuracies = [lds_accuracy, gru_accuracy, lstm_accuracy]
           all_train_accs[display_step] = batched_accuracies(accuracies, mnist.train)
           all_test_accs[display_step]  = batched_accuracies(accuracies, mnist.test)
           print(step, end=': ')
