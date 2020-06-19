@@ -2,6 +2,12 @@ import numpy as np
 import tensorflow as tf
 from linear_recurrent_net.linear_recurrent_net.tensorflow_binding import linear_recurrence
 
+# Takes [batch size, T, d] real
+# Returns [batch_size, T, m] real
+# Note: requires a fixed batch size. This means you must:
+# 1. Use an InputLayer in the Keras model specification. 
+# 2. Pass a TF dataset which has been batched with drop_remainder=True to model.fit(), 
+#    not a NumPy array. (Otherwise the last batch will be the wrong size.)
 class LDStack(tf.keras.layers.Layer):
   # n: state size
   # d: input size
@@ -9,11 +15,30 @@ class LDStack(tf.keras.layers.Layer):
   # k: number of random projections
   # Δ: depth of stack
   # standard: whether to compute 
-  def __init__(self, n, d, m, k, Δ, init='unitary', standard=True):
+  # last_only: return just the last element of the output sequence
+  def __init__(self, n, d, m, k, Δ, init='unitary', standard=True, last_only=False):
     super(LDStack, self).__init__()
+    self.ldstack = LDStackInner(n, d, m, k, Δ, init, standard)
+    self.last_only = last_only
+
+  def call(self, x):
+    x = tf.complex(tf.transpose(x, (1,0,2)), 0.0)
+    y = tf.math.real(self.ldstack(x))
+    if self.last_only:
+      y = y[-1,:]
+    else:
+      y = tf.transpose(y, (1,0,2))
+    return y
+
+
+# Takes time-major complex sequences, which is performant, but not compatible with Keras
+class LDStackInner(tf.keras.layers.Layer):
+  def __init__(self, n, d, m, k, Δ, init='unitary', standard=True):
+    super(LDStackInner, self).__init__()
     
-    if d > 1 or k > 1:
-      self.R = tf.Variable(np.random.normal(size=(d,k)), dtype=tf.float32, trainable=False)
+    # FIXME
+    #if d > 1 or k > 1:
+    self.R = tf.Variable(np.random.normal(size=(d,k)), name="R", dtype=tf.float32, trainable=False)
     
     if init == 'unitary':
       (lnλ, C, D, Dₒ), (lnλ_init, C_init, D_init, Dₒ_init) = self.unitary_initialization(m, n, k)
@@ -38,13 +63,13 @@ class LDStack(tf.keras.layers.Layer):
   # Fix r=1, i.e. ln(r) = 0. (For numerical reasons, can fix r=1-𝛿 for some small 𝛿) 
   # Note this only requires n/2 parameters rather than n
   # Should constrain -π ≤ θ ≤ π
-  def unitary_initialization(self, m, n, k):
+  def unitary_initialization(self, m, n, k, trainλ=True):
     if n % 2 != 0:
       raise "n must be even"
 
     half_n = round(n/2)
     θ_init = np.random.uniform(low=-np.pi, high=np.pi, size=[k,half_n]).astype(np.float32)
-    θ = tf.Variable(θ_init, dtype=tf.float32)
+    θ = tf.Variable(θ_init, name="eig_angle", dtype=tf.float32, trainable=trainλ)
     lnλ_r = tf.zeros((k,n), dtype=tf.float32)
     #lnλ_r = np.log(1-𝛿)*tf.ones((k,n), dtype=tf.float32)
       
@@ -52,12 +77,12 @@ class LDStack(tf.keras.layers.Layer):
     lnλ = tf.complex(lnλ_r, lnλ_i)
     lnλ_init = 0 #FIXME
 
-    C_init = np.random.uniform(low=-0.0001, high=0.0001, size=[k,m,n]).astype(np.float32)
-    C = tf.Variable(C_init, dtype=tf.float32)
+    C_init = np.random.uniform(low=-0.000001, high=0.000001, size=[k,m,n]).astype(np.float32) / n
+    C = tf.Variable(C_init, name="C", dtype=tf.float32)
     D_init = np.random.uniform(low=-0.001, high=0.001, size=[k,m]).astype(np.float32)
-    D = tf.Variable(D_init, dtype=tf.float32)
+    D = tf.Variable(D_init, name="D", dtype=tf.float32)
     Dₒ_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[m]).astype(np.float32)
-    Dₒ = tf.Variable(Dₒ_init, dtype=tf.float32)    
+    Dₒ = tf.Variable(Dₒ_init, name="D0", dtype=tf.float32)    
       
     return (lnλ, C, D, Dₒ), (lnλ_init, C_init, D_init, Dₒ_init)
 
@@ -110,13 +135,13 @@ class LDStack(tf.keras.layers.Layer):
     lnλ = tf.reshape(lnλ, [k,n])
 
     if C_init is None:
-      C_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[k,m,n]).astype(np.float32)
+      C_init = np.random.uniform(low=-1, high=1, size=[k,m,n]).astype(np.float32) / n
     C = tf.Variable(C_init, dtype=tf.float32)
     if D_init is None:
-      D_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[k,m]).astype(np.float32)
+      D_init = np.random.uniform(low=-1, high=1, size=[k,m]).astype(np.float32) / m
     D = tf.Variable(D_init, dtype=tf.float32)
     if Dₒ_init is None:
-      Dₒ_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[m]).astype(np.float32)
+      Dₒ_init = 0.0
     Dₒ = tf.Variable(Dₒ_init, dtype=tf.float32)  
 
     return (lnλ, C, D, Dₒ), (np.log(λ_init), C_init, D_init, Dₒ_init) 
@@ -153,7 +178,7 @@ class LDStack(tf.keras.layers.Layer):
     # = -∑_{i≠j} log(1 - λj/λi)
     # = -∑_j log(1 - ratios[k,j,i]) 
     # because log(1 - ratios[k,i,i]) = 0
-    lnBʹ = -1* tf.reduce_sum(tf.log(1.0 - ratios), axis=1)
+    lnBʹ = -1* tf.reduce_sum(tf.math.log(1.0 - ratios), axis=1)
     # Bʹ : [k, n]
     # Bʹ·x : [T, b, k*n]
     Bʹ = tf.exp(lnBʹ)
@@ -181,16 +206,16 @@ class LDStack(tf.keras.layers.Layer):
     # log C'_{i,j}
     # = log <C_{i,:}, U_{:,j}>
     # = log sum_k exp(log C_{i,k} + log U_{k,j})
-    lnC = tf.transpose(tf.log(tf.complex(C, 0.0)), (1,0,2)) # [m, k, n]
+    lnC = tf.transpose(tf.math.log(tf.complex(C, 0.0)), (1,0,2)) # [m, k, n]
     powers = tf.cast(n - tf.range(1,n+1), tf.complex64)
     lnU = tf.reshape(-1*powers, (1,-1,1)) * tf.expand_dims(lnλ, 1) # [1,n,1]*[k,1,n] -> [k, n, n] 
     sum_logs = tf.expand_dims(lnC,-1) + tf.expand_dims(lnU, 0) # [m,k,n,1]+[1,k,n,n] -> [m, k, n, n]
     Cʹ = tf.reduce_sum(tf.exp(sum_logs), axis=-2) # [m, k, n]
     Cʹ = tf.transpose(Cʹ, (1,2,0)) # [k, n, m]
     
-    Cʹ·sʹ = tf.real(tf.reduce_sum(tf.expand_dims(sʹ, -1)*tf.reshape(Cʹ, (1,1,k,n,m)), axis=-2))
-    D·x = tf.real(tf.expand_dims(x, -1)) * tf.reshape(D, (1,1,k,m))
-    y = Cʹ·sʹ + D·x + Dₒ
+    Cʹ·sʹ = tf.reduce_sum(tf.expand_dims(sʹ, -1)*tf.reshape(Cʹ, (1,1,k,n,m)), axis=-2)
+    D·x = tf.expand_dims(x, -1) * tf.complex(tf.reshape(D, (1,1,k,m)), 0.0)
+    y = Cʹ·sʹ + D·x + tf.complex(Dₒ, 0.0)
 
     return sʹ, y
 
@@ -199,7 +224,7 @@ class LDStack(tf.keras.layers.Layer):
 
   # x: [T, batch size, d] is complex (this is unusual, but matches the format of linear_recurrence.
   #       And actually, is faster for GPU computation, and should be the standard for RNNs.)
-  # Returns output y of shape [T, batch size, m]
+  # Returns complex output y of shape [T, batch size, m]
   def call(self, x):
     T, b, d = x.shape
     k, n = (self.k, self.n)
