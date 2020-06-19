@@ -61,7 +61,7 @@ public:
 
     compute_linear_recurrence(cu_decays, cu_impulses,
 			      cu_initial_state, cu_response,
-			      n_dims, n_steps);//, ctx->eigen_device<Eigen::GpuDevice>());
+			      n_dims, n_steps, ctx->eigen_device<Eigen::GpuDevice>());
   }
 };
 REGISTER_KERNEL_BUILDER(Name("LinearRecurrence").Device(DEVICE_GPU), GpuLinearRecurrenceOp);

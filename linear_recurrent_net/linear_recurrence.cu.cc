@@ -2,8 +2,8 @@
 #include <stdio.h>
 #include <cuComplex.h>
 #define EIGEN_USE_GPU
-//#include "tensorflow/core/util/gpu_kernel_helper.h"
-#include "tensorflow/core/util/cuda_kernel_helper.h"
+#include "tensorflow/core/util/gpu_kernel_helper.h"
+// 1.13 #include "tensorflow/core/util/cuda_kernel_helper.h"
 
 #define CEIL_DIV(x, y) ((x + y - 1) / y)
 
@@ -239,11 +239,9 @@ extern "C" {
  * initial_state:
  *   array of size n_dims located on GPU
  */
-void compute_linear_recurrence(cuComplex *decays, cuComplex *impulses, cuComplex *initial_state, cuComplex *out, int n_dims, int n_steps) {
-
-  // TODO: query
-  int n_SMs = 15;
-  int n_blocks_per_sm = 2;
+void compute_linear_recurrence(cuComplex *decays, cuComplex *impulses, cuComplex *initial_state, cuComplex *out, int n_dims, int n_steps, const Eigen::GpuDevice& d) {
+  int n_SMs = d.getNumGpuMultiProcessors(); //15;
+  int n_blocks_per_sm = d.maxGpuThreadsPerMultiProcessor() / d.maxGpuThreadsPerBlock(); //2;
 
   // we want at least 32 elements per block, but no reason to run
   // with more than the maximum number of concurrent blocks
@@ -257,15 +255,14 @@ void compute_linear_recurrence(cuComplex *decays, cuComplex *impulses, cuComplex
   cuComplex *d_decay_storage = &d_reduction_mem[0 * n_blocks * 33 * n_dims];
   cuComplex *d_h_storage = &d_reduction_mem[1 * n_blocks * 33 * n_dims];
 
-  // TODO: run kernels on non-default stream?
-  reduction_kernel<<<n_blocks, 1024>>>(decays, impulses, initial_state,
+  reduction_kernel<<<n_blocks, 1024, 0, d.stream()>>>(decays, impulses, initial_state,
 				       d_decay_storage, d_h_storage,
 				       n_dims, n_steps);
 
-  block_scan_kernel<<<n_blocks, 1024>>>(d_decay_storage, d_h_storage,
+  block_scan_kernel<<<n_blocks, 1024, 0, d.stream()>>>(d_decay_storage, d_h_storage,
 					n_dims, n_blocks);
 
-  warp_scan_kernel<<<n_blocks, 1024>>>(decays, impulses,
+  warp_scan_kernel<<<n_blocks, 1024, 0, d.stream()>>>(decays, impulses,
 				       initial_state, out,
 				       d_decay_storage, d_h_storage,
 				       n_dims, n_steps);
@@ -275,13 +272,13 @@ void compute_linear_recurrence(cuComplex *decays, cuComplex *impulses, cuComplex
 
 void compute_serial_linear_recurrence(cuComplex *decays, cuComplex *impulses,
                                       cuComplex *initial_state, cuComplex *out,
-                                      int n_dims, int n_steps) {
+                                      int n_dims, int n_steps, const Eigen::GpuDevice& d) {
   // TODO: query
   int n_SMs = 15;
   int n_blocks_per_sm = 2;
 
   int n_blocks = n_SMs * n_blocks_per_sm;
-  serial_linear_recurrence<<<n_blocks, 1024>>>(decays, impulses, initial_state,
+  serial_linear_recurrence<<<n_blocks, 1024, 0, d.stream()>>>(decays, impulses, initial_state,
                                                out, n_dims, n_steps);
 }
 }
