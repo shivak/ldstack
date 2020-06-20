@@ -87,13 +87,16 @@ class LDStackInner(tf.keras.layers.Layer):
     return (lnλ, C, D, Dₒ), (lnλ_init, C_init, D_init, Dₒ_init)
 
   # Initialization as roots of monic polynomial with random coefficients
-  def randroot_or_fixed_initialization(self, m, n, k, λ_init=None, C_init=None, D_init=None, Dₒ_init=None):
+  def randroot_or_fixed_initialization(self, m, n, k, λ_init=None, C_init=None, D_init=None, Dₒ_init=None, stable=True):
     if λ_init is None:
       λ_init = np.zeros((k,n), dtype=np.complex64)
       for i in np.arange(k):
         Ainit = np.diagflat(np.ones(shape=n-1), 1).astype(np.float32)
         Ainit[-1,:] = np.random.normal(size=n) / n
         λ_init[i] = np.linalg.eigvals(Ainit)
+
+      if stable:
+        λ_init = λ_init / np.maximum(1.0, np.abs(λ_init))
     λ_init = λ_init.flatten()
     
     # isolated (non paired) log eigenvalue ends up real if imaginary part is either 0 or pi 
@@ -125,20 +128,20 @@ class LDStackInner(tf.keras.layers.Layer):
     else:
       lnλ_r = tf.scatter_nd(
                   np.concatenate((np.argwhere(np.isreal(λ_init)), np.argwhere(np.iscomplex(λ_init)))),
-                  tf.real(tf.concat([lnλ_real, lnλ_comp], axis=0)),
+                  tf.math.real(tf.concat([lnλ_real, lnλ_comp], axis=0)),
                   [k*n]) 
       lnλ_i = tf.scatter_nd(
                   np.concatenate((np.argwhere(np.isreal(λ_init)), np.argwhere(np.iscomplex(λ_init)))),
-                  tf.imag(tf.concat([lnλ_real, lnλ_comp], axis=0)),
+                  tf.math.imag(tf.concat([lnλ_real, lnλ_comp], axis=0)),
                   [k*n]) 
       lnλ = tf.complex(lnλ_r, lnλ_i)
     lnλ = tf.reshape(lnλ, [k,n])
 
     if C_init is None:
-      C_init = np.random.uniform(low=-1, high=1, size=[k,m,n]).astype(np.float32) / n
+      C_init = np.random.uniform(low=-0.000001, high=0.000001, size=[k,m,n]).astype(np.float32) / n**2
     C = tf.Variable(C_init, dtype=tf.float32)
     if D_init is None:
-      D_init = np.random.uniform(low=-1, high=1, size=[k,m]).astype(np.float32) / m
+      D_init = np.random.uniform(low=-0.001, high=0.001, size=[k,m]).astype(np.float32) / m
     D = tf.Variable(D_init, dtype=tf.float32)
     if Dₒ_init is None:
       Dₒ_init = 0.0
@@ -183,7 +186,7 @@ class LDStackInner(tf.keras.layers.Layer):
     # Bʹ·x : [T, b, k*n]
     Bʹ = tf.exp(lnBʹ)
     Bʹ·x = tf.reshape(tf.expand_dims(x, -1)*Bʹ, (T, b, k*n))
-
+    
     # α·λ : [T, b, k*n]
     # sʹ : [T, b, k, n]  
     if α is None:
@@ -200,27 +203,20 @@ class LDStackInner(tf.keras.layers.Layer):
     sʹ = linear_recurrence(α·λ, Bʹ·x)
     sʹ = tf.reshape(sʹ, [T, b, k, n])
       
-    # U_{i,j} = 1 / λj^{n-i}
-    # log U_{i,j} = -(n-i) logλj
-    # let C be a row of 
-    # log C'_{i,j}
-    # = log <C_{i,:}, U_{:,j}>
-    # = log sum_k exp(log C_{i,k} + log U_{k,j})
-    lnC = tf.transpose(tf.math.log(tf.complex(C, 0.0)), (1,0,2)) # [m, k, n]
-    powers = tf.cast(n - tf.range(1,n+1), tf.complex64)
-    lnU = tf.reshape(-1*powers, (1,-1,1)) * tf.expand_dims(lnλ, 1) # [1,n,1]*[k,1,n] -> [k, n, n] 
-    sum_logs = tf.expand_dims(lnC,-1) + tf.expand_dims(lnU, 0) # [m,k,n,1]+[1,k,n,n] -> [m, k, n, n]
-    Cʹ = tf.reduce_sum(tf.exp(sum_logs), axis=-2) # [m, k, n]
+    # Numerically stable calculation of Cʹ = CU
+    λⁱ = tf.expand_dims(tf.math.pow(tf.expand_dims(λ, -1), tf.cast(tf.range(1,n+1), dtype=tf.complex64)), 0) # [1, k, n, n]
+    tf.debugging.check_numerics(tf.math.real(λⁱ), message='lampow nan')
+    C = tf.expand_dims(tf.transpose(tf.cast(C, tf.complex64), (1,0,2)), 2) # [m, k, 1, n]
+    C·λⁱ = tf.reduce_sum(C*λⁱ, axis=-1) # [m, k, n]
+    Cʹ = tf.exp(tf.math.log(tf.cast(-n, tf.complex64)*tf.expand_dims(lnλ, 0)) + tf.math.log(C·λⁱ))
     Cʹ = tf.transpose(Cʹ, (1,2,0)) # [k, n, m]
-    
+    tf.debugging.check_numerics(tf.math.real(Cʹ), message="C'")
+      
     Cʹ·sʹ = tf.reduce_sum(tf.expand_dims(sʹ, -1)*tf.reshape(Cʹ, (1,1,k,n,m)), axis=-2)
     D·x = tf.expand_dims(x, -1) * tf.complex(tf.reshape(D, (1,1,k,m)), 0.0)
     y = Cʹ·sʹ + D·x + tf.complex(Dₒ, 0.0)
 
     return sʹ, y
-
-  def recipsq(self, a):
-    return tf.complex(tf.math.rsqrt(1 + tf.math.square(tf.abs(a))), 0.0)
 
   # x: [T, batch size, d] is complex (this is unusual, but matches the format of linear_recurrence.
   #       And actually, is faster for GPU computation, and should be the standard for RNNs.)
@@ -243,7 +239,7 @@ class LDStackInner(tf.keras.layers.Layer):
     for i in np.arange(self.Δ):
       sʹ, y = self.batch_simo_lds(x, self.lnλ, self.C, self.D, self.Dₒ, α, self.standard)
       λ·sʹ = tf.reshape(λ, (1,1,k,n)) * sʹ
-      α = self.recipsq(λ·sʹ)
+      α = recipsq(λ·sʹ)
 
     y = tf.reduce_mean(y, axis=2)
     return y
@@ -253,3 +249,7 @@ class LDStackInner(tf.keras.layers.Layer):
     if self.Δ > 1:
       raise "LDStack with Δ > 1 does not represent an LDS"
     return None
+
+# Reciprocal square root nonlinearity
+def recipsq(a):
+  return tf.complex(tf.math.rsqrt(1 + tf.math.square(tf.abs(a))), 0.0)
