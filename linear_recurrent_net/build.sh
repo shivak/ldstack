@@ -1,4 +1,11 @@
 #! /bin/bash
+
+# Custom ops should be built in a Docker container, per:
+#    https://github.com/tensorflow/custom-op
+# However, the following hacks may suffice.
+#mkdir -p /usr/local/lib/python3.6/dist-packages/tensorflow/include/tensorflow/core/util/third_party/gpus/cuda
+#ln -s /usr/local/cuda/include /usr/local/lib/python3.6/dist-packages/tensorflow/include/tensorflow/core/util/third_party/gpus/cuda/include 
+
 rm -rf lib/
 
 TF_CFLAGS=( $(python -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_compile_flags()))') )
