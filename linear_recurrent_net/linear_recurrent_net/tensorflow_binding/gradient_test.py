@@ -1,3 +1,9 @@
+import numpy as np
+import tensorflow as tf
+import sys
+sys.path.append('./')
+from linear_recurrent_net.tensorflow_binding import linear_recurrence, linear_recurrence_cpu
+
 n_dims = 20
 n_steps = 30
 
@@ -6,9 +12,11 @@ decays = (np.random.uniform(size=(n_steps, n_dims)) + 1j*np.random.uniform(size=
 impulses = np.random.randn(n_steps, n_dims).astype(np.complex64)
 initial_state = np.random.randn(n_dims).astype(np.complex64)
 
+def relnorm(sym, num):
+  return tf.linalg.norm(sym - num) / tf.linalg.norm(num)
+
 def err(vals):
-  for sym, num in zip(*vals):
-    return tf.linalg.norm(sym - num) / tf.linalg.norm(num)
+  return [relnorm(sym, num) for sym, num in zip(*vals)]
 
 def run_test(lin_rec):
   response = lambda inp: lin_rec(tf.complex(inp, decays.imag), impulses, initial_state)
@@ -27,6 +35,10 @@ def run_test(lin_rec):
   print('Initial state grad err:', err(tf.test.compute_gradient(response, [initial_state])))
 
 if __name__ == "__main__":
+  print("GPU vs CPU forward pass")
+  print(relnorm(linear_recurrence(decays, impulses, initial_state),
+                linear_recurrence_cpu(decays, impulses, initial_state)))
+                
   print("GPU")
   run_test(linear_recurrence)
   print("CPU")
