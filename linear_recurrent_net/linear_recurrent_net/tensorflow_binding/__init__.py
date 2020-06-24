@@ -154,4 +154,3 @@ def sparse_linear_recurrence_naive(decay, scales, impulse, init_state):
     for t in range(T):
         h = decay*h + impulse*tf.expand_dims(scales[t], -1)
     return h
-print("...")
