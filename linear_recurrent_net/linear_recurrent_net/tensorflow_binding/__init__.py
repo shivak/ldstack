@@ -104,9 +104,11 @@ def _sparse_linear_recurrence_grad(op, dL_dhT):
     ))
     
     # Warning: TxN 
-    λⁱ = tf.transpose(tf.math.pow(tf.expand_dims(decay, -1), tf.cast(T - tf.range(1, T+1), tf.complex64)), (2,0,1)) 
-    dL_dscales = tf.reduce_sum(tf.math.conj(tf.expand_dims(impulse, 0) * λⁱ) * dL_dhT, axis=-1)
-    
+    ln_decay = tf.math.log(decay)
+    pows = tf.cast(T - tf.range(1, T+1), tf.complex64)
+    decayⁱ = tf.math.exp(tf.reshape(pows, (T,1,1)) * tf.expand_dims(ln_decay, 0)) 
+    dL_dscales = tf.reduce_sum(tf.math.conj(decayⁱ) * tf.math.conj(impulse) * dL_dhT, axis=-1) 
+      
     dL_dimpulse = dL_dhT * tf.math.conj(_lr_module.sparse_linear_recurrence(
         decay,
         scales,
@@ -154,3 +156,4 @@ def sparse_linear_recurrence_naive(decay, scales, impulse, init_state):
     for t in range(T):
         h = decay*h + impulse*tf.expand_dims(scales[t], -1)
     return h
+print("...")
