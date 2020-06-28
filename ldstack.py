@@ -1,13 +1,32 @@
-# This LDStack implementation is somewhat unusual in that it supports multiple different parameterizations
-# of the optimization variables. (For example, we can optimize in logspace, or not; over unitary eigenvalues
-# parameterized solely by angles; etc.) These must be initialized in different manners, and are they are
-# consumed by the algorithm in slightly different manners. 
+import numpy as np
+import tensorflow as tf
+from linear_recurrent_net.linear_recurrent_net.tensorflow_binding import linear_recurrence, sparse_linear_recurrence
 
-#def unitary_eig_params(trainλ=True):
-#  def params(n,m,k):
-#    ...
-#    return underlying, unitary_λ
-#  return params
+'''
+LDStack is somewhat unusual in that it supports multiple different underlying parameterizations of the 
+optimization variables. A simple example is that we can optimize over C as an n-dimensional real vector,
+or over C' = CU, an n-dimensional complex vector, or over log C'. These different parameterizations must be 
+initialized in different manners. They "reconstitute" the actual quantities used by the model in different
+ways, as well. 
+
+Each parameterization is defined by two functions. 
+1. An initialization function, which takes options for the parameterization, and 
+returns a function which is called once the dimensions of the variables are known. 
+That function, in turn, returns the underlying optimization variables, as well as
+the reconstitution function, defined next.
+Example:
+   def unitary_eig_params(trainλ=True, useD=True):
+     def params(n,m,k):
+       ...
+       return underlying, θ
+     return params
+
+2. A reconstitution function, which takes the underlying variables and produces the quantities used by 
+the model. Example:
+   def unitary_eig_constitute(θ):
+     ...
+     return lnλ, λ
+'''
 
 # Initialize with uniformly random complex eigenvalues of magnitude 1.
 # If λ has polar coordinates (r, θ) then ln(λ) = ln(r) + θi
