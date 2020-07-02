@@ -34,17 +34,17 @@ the model. Example:
 # Fix r=1, i.e. ln(r) = 0. (For numerical reasons, can fix r=1-𝛿 for some small 𝛿) 
 # Note this only requires n/2 parameters rather than n
 # Should constrain -π ≤ θ ≤ π
-def unitary_eig_param(trainλ=True):
+def unitary_AB_param(trainλ=True):
   def params(n, m, k):
     if n % 2 != 0:
       raise "n must be even"
     half_n = round(n/2)
     θ_init = np.random.uniform(low=-np.pi, high=np.pi, size=[k,half_n]).astype(np.float32)
     θ = tf.Variable(θ_init, name="eig_angle", dtype=tf.float32, trainable=trainλ)
-    return (θ,), unitary_eig_constitute
+    return (θ,), unitary_AB_constitute
   return params
 
-def unitary_eig_constitute(θ):
+def unitary_AB_constitute(θ):
   k, half_n = θ.shape
   lnλ_r = tf.zeros((k,half_n*2), dtype=tf.float32)
   lnλ_i = tf.concat([θ, -θ], axis=1)
@@ -53,7 +53,7 @@ def unitary_eig_constitute(θ):
   return lnλ, λ
 
 # Initialization as roots of monic polynomial with random coefficients
-def randroot_eig_param(stable=True):
+def randroot_AB_param(max_radius=1.0, standard=False):
   def params(n,m,k):
     λ_init = np.zeros((k,n), dtype=np.complex64)
     for i in np.arange(k):
@@ -61,16 +61,16 @@ def randroot_eig_param(stable=True):
       Ainit[-1,:] = np.random.normal(size=n) / n
       λ_init[i] = np.linalg.eigvals(Ainit)
 
-    if stable:
-      λ_init = λ_init / np.maximum(1.0, np.abs(λ_init))
-
-    return log_eig_param(λ_init)
+    if max_radius is not None:
+      λ_init = λ_init / np.maximum(max_radius, np.abs(λ_init))
+    return standard_AB_param(λ_init)(n,m,k) if standard else log_AB_param(λ_init)(n,m,k)
   return params
 
 
-def log_eig_param(λ_init):
+def log_AB_param(λ_init):
+  λ_init_val = λ_init # Python local variable strangeness
   def params(n,m,k):
-    λ_init = λ_init.flatten()
+    λ_init = λ_init_val.flatten()
     
     # isolated (unpaired) log eigenvalue ends up real if imaginary part is either 0 or pi 
     # only optimize over real part, fix the imaginary part. this ensures eigenvalue is real, but fixes its sign
@@ -89,11 +89,10 @@ def log_eig_param(λ_init):
     where_λ_init_r = np.argwhere(np.isreal(λ_init))
     where_λ_init_i = np.argwhere(np.iscomplex(λ_init))
 
-    return (lnλ_real_r, lnλ_real_init.imag, lnλ_comp_a, lnλ_comp_b, where_λ_init_r, where_λ_init_i), log_eig_constitute
+    return (lnλ_real_r, lnλ_real_init.imag, lnλ_comp_a, lnλ_comp_b, where_λ_init_r, where_λ_init_i, k, n), log_AB_constitute
   return params
 
-def log_eig_constitute(lnλ_real_r, lnλ_real_i_init, lnλ_comp_a, lnλ_comp_b, where_λ_init_r, where_λ_init_i):
-  k,n,_ = lnCʹ_r.shape
+def log_AB_constitute(lnλ_real_r, lnλ_real_i_init, lnλ_comp_a, lnλ_comp_b, where_λ_init_r, where_λ_init_i, k, n):
   lnλ_real = tf.complex(lnλ_real_r, lnλ_real_i_init)
 
   # Keep conjugate pairs adjacent [-b_1, b_1, -b_2, b_2, ...]
@@ -110,69 +109,189 @@ def log_eig_constitute(lnλ_real_r, lnλ_real_i_init, lnλ_comp_a, lnλ_comp_b, 
 
   return lnλ, λ
 
-def canonical_eig_param(n, m, k, useD=False):
+def standard_AB_param(λ_init):
+  λ_init_val = λ_init # Python local variable strangeness
   def params(n,m,k):
-    a = tf.Variable(tf.random.normal((k,n)) / float(10000*n), name="a", dtype=tf.float32)
-    return (a,), canonical_eig_constitute
+    λ_init = λ_init_val.flatten()
+    
+    λ_real_init = λ_init[np.isreal(λ_init)]
+    λ_real_r = tf.Variable(λ_real_init.real, name="eig_real_r", dtype=tf.float32)
 
-def canonical_eig_constitute(a):
+    comp_pair = (λ_init[np.iscomplex(λ_init)])[::2] # only get one part of conjugate pair.
+    λ_comp_init_a = comp_pair.real.astype(np.float32)
+    λ_comp_init_b = comp_pair.imag.astype(np.float32)
+              
+    λ_comp_a = tf.Variable(λ_comp_init_a, name="eig_comp_a", dtype=tf.float32)
+    λ_comp_b = tf.Variable(λ_comp_init_b, name="eig_comp_b", dtype=tf.float32)
+    
+    where_λ_init_r = np.argwhere(np.isreal(λ_init))
+    where_λ_init_i = np.argwhere(np.iscomplex(λ_init))
+
+    return (λ_real_r, λ_comp_a, λ_comp_b, where_λ_init_r, where_λ_init_i, k, n), standard_AB_constitute
+  return params
+
+def standard_AB_constitute(λ_real_r, λ_comp_a, λ_comp_b, where_λ_init_r, where_λ_init_i, k, n):
+  λ_real = tf.complex(λ_real_r, 0.0)
+
+  # Keep conjugate pairs adjacent [-b_1, b_1, -b_2, b_2, ...]
+  λ_comp_r = tf.repeat(λ_comp_a, 2, axis=0)
+  λ_comp_i = tf.repeat(λ_comp_b, 2, axis=0) * np.tile([-1,1], λ_comp_b.shape[0])
+  λ_comp = tf.complex(λ_comp_r, λ_comp_i)
+  # restore original order of eigenvalues
+  λ = tf.scatter_nd(
+              np.concatenate((where_λ_init_r, where_λ_init_i)),
+              tf.concat([λ_real, λ_comp], axis=0),
+              [k*n])    
+  λ = tf.reshape(λ, [k,n])
+  lnλ = tf.math.log(λ)
+
+  return lnλ, λ
+
+def canonical_AB_param(a_stddev = 0.00001):
+  def params(n,m,k):
+    a = tf.Variable(tf.random.normal((k,n), stddev=a_stddev) / float(n), name="a", dtype=tf.float32)
+    return (a,), canonical_AB_constitute
+  return params
+
+def canonical_AB_constitute(a):
   k,n = a.shape
   A = np.diagflat(np.ones(shape=n-1), 1)[:-1]
   A = np.tile(A.reshape(1,n-1,n), (k,1,1))
   A = A.astype(np.float32)
   a_ = tf.expand_dims(a, 1)
   A = tf.concat([A, -a_], axis=1)
-  λ = tf.linalg.eigvals(A) #FIXME: double work
+  λ = tf.linalg.eigvals(A) #FIXME: double work?
   lnλ = tf.math.log(λ)
   return lnλ, λ
 
 # Optimize over real C, potentially encountering numerical stability
-def standard_out_param(C_init=None, D_init=None, Dₒ_init=None):
+def standard_C_param(C_init=None, C_stddev=0.00001):
   def params(n,m,k):
-    C = tf.Variable(tf.random.normal((k,n,m), stddev=0.00001), name="C", dtype=tf.float32)
-
-    if D_init is None:
-      D_init = np.random.uniform(low=-0.001, high=0.001, size=[k,m]).astype(np.float32) / m
-    D = tf.Variable(D_init, name="D", dtype=tf.float32)
-    if Dₒ_init is None:
-      Dₒ_init = 0.0
-    Dₒ = tf.Variable(Dₒ_init, name="D0", dtype=tf.float32)  
-
-    return (C, D, Dₒ), standard_out_constitute
+    C = tf.Variable(tf.random.normal((k,n,m), stddev=C_stddev), name="C", dtype=tf.float32)
+    return (C,), standard_C_constitute
   return params
 
-def standard_out_constitute(lnλ, λ, C, D, Dₒ):
+def standard_C_constitute(lnλ, λ, C):
   Cʹ = computeCʹ(lnλ, λ, C) 
-  return Cʹ, D, Dₒ
+  return Cʹ
 
 
 # Expands optimization over real C to complex Cʹ.
 # After optimization, CU ≈ Cʹ with equivalent loss can be found 
 # Furthermore, optimize over lnCʹ for numerical reasons
 # (typically, C is very close to 0)
-# Uses lnλ, λ for initial value 
-def relaxed_out_param(useD=True):
-  def params(n,m,k):
-    lnCʹ_init = tf.math.log(tf.cast(tf.random.normal((k,n,m), mean=1.0, stddev=0.01), tf.complex64))
-    lnCʹ_r = tf.Variable(tf.math.real(lnCʹ_init), name="lnC'_r", dtype=tf.float32)
-    lnCʹ_i = tf.Variable(tf.math.imag(lnCʹ_init), name="lnC'_i", dtype=tf.float32)
-    
-    if useD:
-      D_init = np.random.uniform(low=-0.001, high=0.001, size=[k,m]).astype(np.float32)
-      Dₒ_init = np.random.uniform(low=-0.0000001, high=0.0000001, size=[m]).astype(np.float32)
-    else:
-      D_init = np.zeros([k,m], dtype=np.float32)
-      Dₒ_init = np.zeros([m], dtype=np.float32)
-    D = tf.Variable(D_init, name="D", dtype=tf.float32, trainable=useD)
-    Dₒ = tf.Variable(Dₒ_init, name="D0", dtype=tf.float32, trainable=useD) 
+# Uses lnλ, λ for initial value
 
-    return (lnCʹ_r, lnCʹ_i, D, Dₒ), relaxed_out_constitute
+def relaxed_C_param(Cʹ_mean=0.0, Cʹ_stddev=1):
+  def params(n,m,k):
+    Cʹ_r = tf.Variable(tf.random.normal((k,n,m), mean=Cʹ_mean, stddev=Cʹ_stddev), name="C'_r", dtype=tf.float32)
+    Cʹ_i = tf.Variable(tf.random.normal((k,n,m), mean=Cʹ_mean, stddev=Cʹ_stddev), name="C'_i", dtype=tf.float32)
+    return (Cʹ_r, Cʹ_i), relaxed_C_constitute
   return params
 
-def relaxed_out_constitute(lnλ, λ, lnCʹ_r, lnCʹ_i, D, Dₒ):
+def relaxed_C_constitute(lnλ, λ, Cʹ_r, Cʹ_i):
+  Cʹ = tf.complex(Cʹ_r, Cʹ_i)
+  return Cʹ
+
+def relaxed_log_C_param(Cʹ_mean=1.0, Cʹ_stddev=0.01):
+  def params(n,m,k):
+    lnCʹ_init = tf.math.log(tf.cast(tf.random.normal((k,n,m), mean=Cʹ_mean, stddev=Cʹ_stddev), tf.complex64))
+    lnCʹ_r = tf.Variable(tf.math.real(lnCʹ_init), name="lnC'_r", dtype=tf.float32)
+    lnCʹ_i = tf.Variable(tf.math.imag(lnCʹ_init), name="lnC'_i", dtype=tf.float32)
+    return (lnCʹ_r, lnCʹ_i), relaxed_log_C_constitute
+  return params
+
+def relaxed_log_C_constitute(lnλ, λ, lnCʹ_r, lnCʹ_i):
   lnCʹ = tf.complex(lnCʹ_r, lnCʹ_i)
   Cʹ = tf.exp(lnCʹ)
-  return Cʹ, D, D
+  return Cʹ
+
+def reciproot_C_param(init_stddev=100, jitter=5):
+  def params(n,m,k):
+    #slide = tf.reshape(tf.math.pow(init_base, tf.cast(tf.range(n, 0, delta=-1), tf.float32)), (1,n,1))
+    #C_init = tf.random.normal((k,n,m), stddev=init_stddev)*slide
+    #print(C_init[0,:,0], "C init")
+    #C_initₚ =  C_init*tf.cast(C_init > 0, tf.float32) + tf.random.uniform((k,n,m), minval=0, maxval=jitter)
+    #C_initₙ = -C_init*tf.cast(C_init < 0, tf.float32) + tf.random.uniform((k,n,m), minval=0, maxval=jitter)
+    #p = tf.reshape(tf.math.reciprocal(tf.cast(tf.range(1,n) - n, tf.float32)), (1,n-1,1)) 
+    #ψₚ_init = tf.math.pow(C_initₚ[:,:-1], p)
+    #print(ψₚ_init[0,:,0], "init")
+    #ψₙ_init = tf.math.pow(C_initₙ[:,:-1], p)  
+    slide = tf.reshape(tf.math.reciprocal(tf.square(tf.cast(tf.range(n, 0, delta=-1), tf.float32))), (1,n,1))
+    C_init = tf.cast(tf.random.normal((k,n,m), stddev=init_stddev)*slide, tf.complex64)
+    p = tf.reshape(tf.math.reciprocal(tf.cast(tf.range(1,n) - n, tf.complex64)), (1,n-1,1)) 
+    ψ_init = tf.math.pow(C_init[:,:-1], p)
+    ψₚ_init =  ψ_init*tf.cast(ψ_init > 0, tf.float32) + tf.random.uniform((k,n-1,m), minval=0, maxval=jitter)
+    ψₙ_init = -ψ_init*tf.cast(ψ_init < 0, tf.float32) + tf.random.uniform((k,n-1,m), minval=0, maxval=jitter)
+    Cₚₙ_init = tf.random.normal((k,1,m))
+    Cₙₙ_init = tf.random.normal((k,1,m))
+    tf.debugging.check_numerics(ψₚ_init, message="ψₚ_init")
+    tf.debugging.check_numerics(ψₙ_init, message="ψₙ_init")
+    ψₚ = tf.Variable(ψₚ_init, name="ψp", constraint=tf.keras.constraints.NonNeg())
+    Cₚₙ = tf.Variable(Cₚₙ_init, name="Cpn", constraint=tf.keras.constraints.NonNeg())
+    ψₙ = tf.Variable(ψₙ_init, name="ψn", constraint=tf.keras.constraints.NonNeg())
+    Cₙₙ = tf.Variable(Cₙₙ_init, name="Cnn", constraint=tf.keras.constraints.NonNeg())
+    return (ψₚ,Cₚₙ,ψₙ,Cₙₙ), reciproot_C_constitute 
+  return params
+
+def reciproot_C_constitute(lnλ, λ, ψₚ,Cₚₙ,ψₙ,Cₙₙ):
+  #mₚ = tf.logical_and(tf.math.is_finite(ψ), ψ >= 0.0) 
+  #mₙ = tf.logical_and(tf.math.is_finite(ψ), ψ < 0.0)
+  Cʹ = σ(λ, ψₚ, Cₚₙ) - σ(λ, ψₙ, Cₙₙ)
+  tf.debugging.check_numerics(tf.math.real(Cʹ), message="Cʹ")
+  return Cʹ
+
+def relaxed_reciproot_C_param(init_gap = 2, init_stddev=0.1):
+  def params(n,m,k):
+    slide = tf.reshape(tf.math.reciprocal(tf.square(tf.cast(tf.range(n, 0, delta=-1), tf.float32))), (1,n,1))
+    C_init = tf.cast(tf.random.normal((k,n,m), stddev=init_stddev)*slide, tf.complex64)
+    p = tf.reshape(tf.math.reciprocal(tf.cast(tf.range(1,n) - n, tf.complex64)), (1,n-1,1)) 
+    ψ_init = tf.math.pow(C_init[:,:-1], p)
+    #print(ψ_init[0,:,0])
+
+    ψ_init_r = tf.reshape(tf.range(n-1, 0, -1, tf.float32), (1,n-1,1)) + tf.random.uniform((k,n-1,m), minval=-0.1, maxval=0.1)
+    ψ_init_i = tf.random.uniform((k,n-1,m), minval=-0.1, maxval=0.1)    
+
+    ψ_r = tf.Variable(ψ_init_r, name="ψ_r")
+    ψ_i = tf.Variable(ψ_init_i, name="ψ_i")
+    Cₙ = tf.Variable(tf.random.normal((k,1,m)), name="C_n")
+    return (ψ_r,ψ_i,Cₙ), relaxed_reciproot_C_constitute 
+  return params    
+
+def relaxed_reciproot_C_constitute(lnλ, λ, ψ_r, ψ_i, Cₙ):
+  ψ = tf.complex(ψ_r, ψ_i)   
+  Cʹ = σ(λ, ψ, Cₙ) 
+  #tf.debugging.check_numerics(tf.math.real(Cʹ), message="Cʹ")
+  return Cʹ
+
+# ψ : [k,n,m] is one of the halves
+# Cₙ : [k,1,m]
+def σ(λ, ψ, Cₙ):
+  k,n = λ.shape
+  ψ_ = tf.expand_dims(tf.cast(ψ, tf.complex64), -2) # [k, n-1, 1, m]  
+  #m_ = tf.expand_dims(tf.cast(m, tf.complex64), -2) # [k, n, 1, m]
+  λ_ = tf.reshape(λ, (k,1,n,1))
+  ψ·λ = ψ_ * λ_ # [k, n-1, n, m]. dim 1 indexed by p, 2 by j
+  p = tf.reshape(tf.cast(tf.range(1,n) - n, dtype=tf.complex64), (1,n-1,1,1))
+  ψ·λⁱ = tf.math.pow(ψ·λ, p) 
+  #tf.debugging.check_numerics(tf.math.real(ψ·λⁱ), message="ψ·λⁱ")
+  return tf.reduce_sum(ψ·λⁱ, axis=1) + tf.cast(Cₙ, tf.complex64)
+
+def standard_D_param(D_init=None, Dₒ_init=None, useD=True):
+  def params(n,m,k):
+    if useD:
+      D = tf.Variable(
+          np.random.uniform(low=-0.001, high=0.001, size=[k,m]).astype(np.float32) / m if D_init is None else D_init,
+          name="D", dtype=tf.float32)
+      Dₒ = tf.Variable(
+          0.0 if Dₒ_init is None else Dₒ_init, 
+          name="D0", dtype=tf.float32)  
+    else:
+      D = tf.zeros((k,m), dtype=tf.float32)
+      Dₒ = 0.0
+    return (D, Dₒ), lambda D, Dₒ: (D,Dₒ)
+  return params
+
 
 # Takes [batch size, T, d] real
 # Returns [batch_size, T, m] real (in averaging mode)
@@ -189,14 +308,19 @@ class LDStack(tf.keras.layers.Layer):
   # Δ: depth of stack
   # standard: whether to compute 
   # last_only: return just the last element of the output sequence
-  def __init__(self, n, d, m, k=None, Δ=1, eig_param=randroot_eig_param(), out_param=relaxed_out_param(), standard=True, last_only=False, num_stacks=1):
+  def __init__(self, n, d, m, k=None, Δ=1, 
+               AB_param=randroot_AB_param(), 
+               C_param=reciproot_C_param(), 
+               D_param=standard_D_param(), 
+               standard=True, last_only=False, num_stacks=1):
     super(LDStack, self).__init__()
     self.n = n
     self.m = m
     self.k = k
     self.Δ = Δ
-    self.eig_param = eig_param
-    self.out_param = out_param
+    self.AB_param = AB_param
+    self.C_param = C_param
+    self.D_param = D_param
     self.standard = standard
     self.average = k is not None
     self.last_only = last_only
@@ -204,8 +328,7 @@ class LDStack(tf.keras.layers.Layer):
 
   def build(self, input_shape):
     self.b, self.T, d = input_shape
-    print(input_shape, "input shape is")
-    n, m, k, Δ, eig_param, out_param, standard, average, last_only, num_stacks = (self.n, self.m, self.k, self.Δ, self.eig_param, self.out_param, self.standard, self.average, self.last_only, self.num_stacks) 
+    n, m, k, Δ, standard, average, last_only, num_stacks = (self.n, self.m, self.k, self.Δ, self.standard, self.average, self.last_only, self.num_stacks) 
 
     # Only perform random projection if number of projections is specified
     # Otherwise, run SIMO LDS on each coordinate of original input
@@ -217,11 +340,11 @@ class LDStack(tf.keras.layers.Layer):
     self.mid_layers = []
     # Performance optimization for sparse, purely-linear case 
     if Δ == 1 and num_stacks == 1 and last_only:
-      self.last_layer = SparseLDS(n, m, k, init, average, standard)
+      self.last_layer = SparseLDS(n, m, k, self.AB_param, self.C_param, self.D_param, average, standard)
     else:
       for i in np.arange(num_stacks-1):
-        self.mid_layers.append( LDStackInner(n, k, k, Δ, eig_param, out_param, average, standard) )
-      self.last_layer = LDStackInner(n, m, k, Δ, eig_param, out_param, average, standard, last_only=last_only)
+        self.mid_layers.append( LDStackInner(n, k, k, Δ, self.AB_param, self.C_param, self.D_param, average, standard) )
+      self.last_layer = LDStackInner(n, m, k, Δ, self.AB_param, self.C_param, self.D_param, average, standard, last_only=last_only)
 
   def call(self, x):
     if self.average:
@@ -242,20 +365,13 @@ class LDStack(tf.keras.layers.Layer):
       return tf.transpose(y, (1,0,2,3)) if degree == 4 else tf.transpose(y, (1,0,2))
 
 
-def get_init_and_const_funcs(init):
-  if init == 'unitary':
-    return unitary_initialization, unitary_constitute
-  elif init == 'randroot':
-    return randroot_initialization, fixed_constitute
-  elif init == 'canonical':
-    return canonical_initialization, canonical_constitute
-
 # Average of k SIMO LDS, only returning last state. Uses much more memory-efficient SparseLinearRecurrence op
 class SparseLDS(tf.keras.layers.Layer):
-  def __init__(self, n, m, k, eig_param, out_param, average, standard=True):
+  def __init__(self, n, m, k, AB_param, C_param, D_param, average, standard=True):
     super(SparseLDS, self).__init__()
-    self.eig_underlying, self.constitute_lnλ_λ = eig_param(n, m, k)
-    self.out_underlying, self.constitute_Cʹ_D_Dₒ = out_param(n, m, k)
+    self.lnλ_λ_underlying, self.constitute_lnλ_λ = AB_param(n, m, k)
+    self.Cʹ_underlying, self.constitute_Cʹ = C_param(n, m, k)
+    self.D_Dₒ_underlying, self.constitute_D_Dₒ = D_param(n, m, k)
     self.k = k
     self.n = n
     self.m = m 
@@ -265,8 +381,9 @@ class SparseLDS(tf.keras.layers.Layer):
   def call(self, x):
     T, b, k = x.shape
     n = self.n
-    lnλ, λ = self.constitute_lnλ_λ(*self.eig_underlying)
-    Cʹ, D, Dₒ = self.constitute_Cʹ_D_Dₒ(*((lnλ, λ) + self.out_underlying))
+    lnλ, λ = self.constitute_lnλ_λ(*self.lnλ_λ_underlying)
+    Cʹ = self.constitute_Cʹ(*((lnλ, λ) + self.Cʹ_underlying))
+    D, Dₒ = self.constitute_D_Dₒ(*self.D_Dₒ_underlying)
     Bʹ = computeBʹ(lnλ, λ)
 
     # linear_recurrence computes sʹ_t = λ·sʹ_{t-1} + Bx_t
@@ -293,10 +410,11 @@ class SparseLDS(tf.keras.layers.Layer):
 
 # Full generality, but slower
 class LDStackInner(tf.keras.layers.Layer):
-  def __init__(self, n, m, k, Δ, eig_param, out_param, average, standard=True, last_only=False):
+  def __init__(self, n, m, k, Δ, AB_param, C_param, D_param, average, standard=True, last_only=False):
     super(LDStackInner, self).__init__()
-    self.eig_underlying, self.constitute_lnλ_λ = eig_param(n, m, k)
-    self.out_underlying, self.constitute_Cʹ_D_Dₒ = out_param(n, m, k)
+    self.lnλ_λ_underlying, self.constitute_lnλ_λ = AB_param(n, m, k)
+    self.Cʹ_underlying, self.constitute_Cʹ = C_param(n, m, k)
+    self.D_Dₒ_underlying, self.constitute_D_Dₒ = D_param(n, m, k)
     self.n = n
     self.m = m 
     self.k = k
@@ -366,8 +484,9 @@ class LDStackInner(tf.keras.layers.Layer):
   def call(self, x):
     T, b, k = x.shape
     n = self.n
-    lnλ, λ = self.constitute_lnλ_λ(*self.eig_underlying)
-    Cʹ, D, Dₒ = self.constitute_Cʹ_D_Dₒ(*((lnλ, λ) + self.out_underlying))
+    lnλ, λ = self.constitute_lnλ_λ(*self.lnλ_λ_underlying)
+    Cʹ = self.constitute_Cʹ(*((lnλ, λ) + self.Cʹ_underlying))
+    D, Dₒ = self.constitute_D_Dₒ(*self.D_Dₒ_underlying)
 
     # λ : [k, n]
     # α : [T, b, k, n]
@@ -408,14 +527,23 @@ def computeBʹ(lnλ, λ):
   return Bʹ
 
 
-def computeCʹ(lnλ, λ, C, first_method=False): 
-  n = λ.shape[-1]
+# C is [k,n,m]. Returns [k,n,m]
+# in split form, where Cʹ = ψₚ - ψₘ  
+def computeCʹ(lnλ, λ, C, first_method=True): 
+  k,n = λ.shape
 
-  if first_method:
+  if True:
+    # Naive
+    p = tf.reshape(tf.cast(tf.range(1,n+1) - n, dtype=tf.complex64), (1,n,1,1))
+    λⁱ = tf.exp(p * tf.reshape(lnλ, (k,1,n,1))) # [k,n,n,1]
+    tf.debugging.check_numerics(tf.math.real(λⁱ), message="λⁱ")
+    C_ = tf.expand_dims(tf.cast(C, tf.complex64), -2) # [k, n, 1, m] 
+    Cʹ = tf.reduce_sum(C_*λⁱ, axis=2) # [k, n, m] 
+  elif first_method:
     # Avoids taking log(C), but does need to take log(C·λⁱ)
-    # BROKEN
     λⁱ = tf.expand_dims(tf.math.pow(tf.expand_dims(λ, -1), tf.cast(tf.range(1,n+1), dtype=tf.complex64)), 0) # [1, k, n, n]  
-    C = tf.expand_dims(tf.transpose(tf.cast(C, tf.complex64), (1,0,2)), 2) # [m, k, 1, n] 
+    tf.debugging.check_numerics(tf.math.real(λⁱ), message="λⁱ")
+    C = tf.expand_dims(tf.transpose(tf.cast(C, tf.complex64), (2,0,1)), 2) # [m, k, 1, n] 
     C·λⁱ = tf.reduce_sum(C*λⁱ, axis=-1) # [m, k, n]  
     Cʹ = tf.exp(tf.cast(-n, tf.complex64)*tf.expand_dims(lnλ, 0) + tf.math.log(C·λⁱ)) # [1,k,n]+[m,k,n]
     Cʹ = tf.transpose(Cʹ, (1,2,0)) # [k, n, m]
@@ -430,6 +558,9 @@ def computeCʹ(lnλ, λ, C, first_method=False):
   tf.debugging.check_numerics(tf.math.real(Cʹ), message="C'")
   return Cʹ
 
+
+
 # Reciprocal square root nonlinearity
 def recipsq(a):
-  return tf.complex(tf.math.rsqrt(1 + tf.math.square(tf.abs(a))), 0.0)
+#  return tf.complex(tf.math.rsqrt(1 + tf.math.square(tf.abs(a))), 0.0)
+  return tf.math.rsqrt(1 + a*tf.math.conj(a))
