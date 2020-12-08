@@ -5,7 +5,7 @@ The main construction is **LDStack**, a drop-in replacement for nonlinear RNNs (
 The core computational primitive: single-input, multiple-output **(SIMO) LDS** parameterized in terms of complex eigenvalues. These have a parallel CUDA implementation. 
 The <a href="./NeurIPS2020_experiments.ipynb">Jupyter notebook</a> reproduces the experiments provided in the paper.
 
-The broad goal: make RNNs fast (on long sequences), accurate (with nonlinear expressive power) *and* trustworthy (via simpler mathematical and intuitive analysis). 
+The broad goal: make RNNs **fast** (on long sequences), **accurate** (with nonlinear expressive power) *and* **trustworthy** (via simpler mathematical and intuitive analysis). 
 If you are a researcher or practitioner interested in trustworthy machine learning models, <a href="mailto:skkaul@cs.cmu.edu">reach out to me</a> and I will help you apply this method.
 
 ### Frequently Asked Questions
