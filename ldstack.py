@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 from linear_recurrent_net.linear_recurrent_net.tensorflow_binding import linear_recurrence, sparse_linear_recurrence
+#from harold import controllability_matrix
 
 '''
 LDStack is somewhat unusual in that it supports multiple different underlying parameterizations of the 
@@ -8,7 +9,6 @@ optimization variables. A simple example is that we can optimize over C as an n-
 or over C' = CU, an n-dimensional complex vector, or over log C'. These different parameterizations must be 
 initialized in different manners. They "reconstitute" the actual quantities used by the model in different
 ways, as well. 
-
 Each parameterization is defined by two functions. 
 1. An initialization function, which takes options for the parameterization, and 
 returns a function which is called once the dimensions of the variables are known. 
@@ -20,7 +20,6 @@ Example:
        ...
        return underlying, θ
      return params
-
 2. A reconstitution function, which takes the underlying variables and produces the quantities used by 
 the model. Example:
    def unitary_eig_constitute(θ):
@@ -34,37 +33,119 @@ the model. Example:
 # Fix r=1, i.e. ln(r) = 0. (For numerical reasons, can fix r=1-𝛿 for some small 𝛿) 
 # Note this only requires n/2 parameters rather than n
 # Should constrain -π ≤ θ ≤ π
-def unitary_AB_param(trainλ=True):
+def log_polar_AB_param(train_ln_r=True, 
+                       train_θ=True, 
+                       ln_r_init=tf.keras.initializers.RandomUniform(minval=-10,maxval=0), 
+                       θ_init=tf.keras.initializers.RandomUniform(-2*np.pi, 2*np.pi)):
   def params(n, m, k):
     if n % 2 != 0:
       raise "n must be even"
     half_n = round(n/2)
-    θ_init = np.random.uniform(low=-np.pi, high=np.pi, size=[k,half_n]).astype(np.float32)
-    θ = tf.Variable(θ_init, name="eig_angle", dtype=tf.float32, trainable=trainλ)
-    return (θ,), unitary_AB_constitute
-  return params
 
-def unitary_AB_constitute(θ):
-  k, half_n = θ.shape
-  lnλ_r = tf.zeros((k,half_n*2), dtype=tf.float32)
+    ln_r_val = ln_r_init((k,half_n))
+    θ_val = θ_init((k, half_n))
+    ln_r = tf.Variable(ln_r_val,  name="eig_radius", dtype=tf.float32, trainable=train_ln_r)
+    θ = tf.Variable(θ_val, name="eig_angle",  dtype=tf.float32, trainable=train_θ)
+
+    return (ln_r,θ), log_polar_AB_constitute
+  return params
+ 
+
+def log_polar_AB_constitute(ln_r, θ):
+  k, half_n = ln_r.shape
+  lnλ_r = tf.concat([ln_r, ln_r], axis=1)
   lnλ_i = tf.concat([θ, -θ], axis=1)
   lnλ = tf.complex(lnλ_r, lnλ_i)
   λ = tf.exp(lnλ)
   return lnλ, λ
 
-# Initialization as roots of monic polynomial with random coefficients
-def randroot_AB_param(max_radius=1.0, standard=False):
-  def params(n,m,k):
-    λ_init = np.zeros((k,n), dtype=np.complex64)
-    for i in np.arange(k):
-      Ainit = np.diagflat(np.ones(shape=n-1), 1).astype(np.float32)
-      Ainit[-1,:] = np.random.normal(size=n) / n
-      λ_init[i] = np.linalg.eigvals(Ainit)
+def unitary_AB_param():
+  return log_polar_AB_param(train_ln_r=False, ln_r_init=tf.keras.initializers.Zeros())
 
-    if max_radius is not None:
-      λ_init = λ_init / np.maximum(max_radius, np.abs(λ_init))
-    return standard_AB_param(λ_init)(n,m,k) if standard else log_AB_param(λ_init)(n,m,k)
+
+# Let h be relu or similar "hinge" function. The two parameters (α, ω) represent 
+# two eigenvalues (either both real, or complex conjugate pairs) as: 
+#   α      + h(-ω) i
+#   α+h(ω) - h(-ω) i
+# ω>0 makes the eigenvalues α and α+ω real
+# ω<0 makes the eigenvalues α±ωi conjugate pairs
+#
+# We can also log space.
+# If λ = r exp(iθ) (i.e. has polar coordinates (r, θ)) then ln(λ) = ln(r) + θi
+# Also, ln(λ*) = ln(r) - θi.
+# Then we can repeat the hinging on ln(r) and θ rather than re(λ) and im(λ)
+
+def hinged_AB_param(λ_init=None, h=tf.keras.activations.relu, log=True): #elu(a, 0.1))):
+  def params(n, m, k):
+    if n % 2 != 0:
+      raise "n must be even"
+    half_n = int(n/2)
+
+    if λ_init is None:
+      α_init = tf.keras.initializers.RandomUniform(-1, 1)((k,half_n))
+      ω_init = tf.keras.initializers.RandomUniform(-0.8, 0.8)((k,half_n))
+    else:
+      λ_init_val = λ_init(n,k) if callable(λ_init) else λ_init
+      if log:
+        # hack
+        λ_init_val = np.log(np.absolute(λ_init_val)) + 1j*np.angle(λ_init_val)
+
+      α_init = np.zeros((k,half_n), dtype=np.float32)
+      ω_init = np.zeros((k,half_n), dtype=np.float32)
+      
+      for i in np.arange(k):
+        λ_init_f = λ_init_val[i]
+        # couple of real eigs represented as α and α+ω where ω>0 
+        real_λ = np.real(λ_init_f[np.isreal(λ_init_f)])
+        real_α = np.minimum(real_λ[::2], real_λ[1::2])
+        real_ω = np.maximum(real_λ[::2], real_λ[1::2]) - real_α
+
+        # complex eig pair represented as α ± ωi
+        comp_λ_pair = λ_init_f[np.iscomplex(λ_init_f)][::2] # assumes conj pairs are adjacent
+        comp_α = np.real(comp_λ_pair)
+        comp_ω = -np.abs(np.imag(comp_λ_pair))
+
+        α_init[i] = np.concatenate([real_α, comp_α], axis=0)
+        ω_init[i] = np.concatenate([real_ω, comp_ω], axis=0)
+              
+    α = tf.Variable(α_init, dtype=tf.float32, name="alpha")
+    ω = tf.Variable(ω_init, dtype=tf.float32, name="omega")
+
+    return (α,ω,h,log), hinged_AB_constitute
   return params
+
+def hinged_AB_constitute(α, ω, h, log):
+  r = tf.concat([α, α + h(ω)], axis=1)
+  i = tf.concat([h(-ω), -h(-ω)], axis=1)
+  if log:
+    lnλ = tf.complex(r, i)
+    λ = tf.math.exp(lnλ)
+  else:
+    λ = tf.complex(r, i)
+    lnλ = tf.math.log(λ)
+  return lnλ, λ
+
+# Initialization as roots of monic polynomial with random coefficients
+def randroot_λ_init(n, k, max_radius=1.0):
+  λ_init = np.zeros((k,n), dtype=np.complex64)
+  for i in np.arange(k):
+    Ainit = np.diagflat(np.ones(shape=n-1), 1).astype(np.float32)
+    Ainit[-1,:] = np.random.normal(size=n) / n
+    λ_init[i] = np.linalg.eigvals(Ainit)
+
+  if max_radius is not None:
+    λ_init = λ_init / np.maximum(max_radius, np.abs(λ_init))
+
+  return λ_init
+
+def safe_randroot_λ_init(n, k, scale=4):  
+  return randroot_λ_init(scale*n, k)[:,:n]
+
+# Initialization on Chebyshev nodes
+def chebyshev_λ_init(n, k, kind='first'):
+  f = np.polynomial.chebyshev.chebpts1 if kind == 'first' else np.polynomial.chebyshev.chebpts2
+  p = f(n)
+  return np.tile(np.expand_dims(p, 0), (k, 1)).astype(np.complex64)
 
 
 def log_AB_param(λ_init):
@@ -147,20 +228,32 @@ def standard_AB_constitute(λ_real_r, λ_comp_a, λ_comp_b, where_λ_init_r, whe
 
   return lnλ, λ
 
-def canonical_AB_param(a_stddev = 0.00001):
+def canonical_AB_param(a_stddev = 0.1):
   def params(n,m,k):
     a = tf.Variable(tf.random.normal((k,n), stddev=a_stddev) / float(n), name="a", dtype=tf.float32)
-    return (a,), canonical_AB_constitute
+    A = np.diagflat(np.ones(shape=n-1), 1)[:-1]
+    A = np.tile(A.reshape(1,n-1,n), (k,1,1))
+    A = A.astype(np.float32)
+    return (a,A), canonical_AB_constitute
   return params
 
-def canonical_AB_constitute(a):
-  k,n = a.shape
-  A = np.diagflat(np.ones(shape=n-1), 1)[:-1]
-  A = np.tile(A.reshape(1,n-1,n), (k,1,1))
-  A = A.astype(np.float32)
+def canonical_AB_constitute(a, A):
   a_ = tf.expand_dims(a, 1)
   A = tf.concat([A, -a_], axis=1)
-  λ = tf.linalg.eigvals(A) #FIXME: double work?
+
+  λ, _ = tf.linalg.eig(A) #FIXME: double work?
+  lnλ = tf.math.log(λ)
+  return lnλ, λ
+
+# Used for naive variant, which just has plain real eigenvalues
+def naive_AB_param():
+  def params(n,m,k):
+    λ = tf.Variable(tf.keras.initializers.GlorotNormal()((k,n)), dtype=tf.float32)
+    return (λ,), naive_AB_constitute
+  return params
+
+def naive_AB_constitute(λ):
+  λ = tf.complex(λ, 0.0)
   lnλ = tf.math.log(λ)
   return lnλ, λ
 
@@ -172,8 +265,7 @@ def standard_C_param(C_init=None, C_stddev=0.00001):
   return params
 
 def standard_C_constitute(lnλ, λ, C):
-  Cʹ = computeCʹ(lnλ, λ, C) 
-  return Cʹ
+  return C, None
 
 
 # Expands optimization over real C to complex Cʹ.
@@ -191,7 +283,7 @@ def relaxed_C_param(Cʹ_mean=0.0, Cʹ_stddev=1):
 
 def relaxed_C_constitute(lnλ, λ, Cʹ_r, Cʹ_i):
   Cʹ = tf.complex(Cʹ_r, Cʹ_i)
-  return Cʹ
+  return None, Cʹ
 
 def relaxed_log_C_param(Cʹ_mean=1.0, Cʹ_stddev=0.01):
   def params(n,m,k):
@@ -204,363 +296,396 @@ def relaxed_log_C_param(Cʹ_mean=1.0, Cʹ_stddev=0.01):
 def relaxed_log_C_constitute(lnλ, λ, lnCʹ_r, lnCʹ_i):
   lnCʹ = tf.complex(lnCʹ_r, lnCʹ_i)
   Cʹ = tf.exp(lnCʹ)
-  return Cʹ
-
-def reciproot_C_param(init_stddev=100, jitter=5):
-  def params(n,m,k):
-    #slide = tf.reshape(tf.math.pow(init_base, tf.cast(tf.range(n, 0, delta=-1), tf.float32)), (1,n,1))
-    #C_init = tf.random.normal((k,n,m), stddev=init_stddev)*slide
-    #print(C_init[0,:,0], "C init")
-    #C_initₚ =  C_init*tf.cast(C_init > 0, tf.float32) + tf.random.uniform((k,n,m), minval=0, maxval=jitter)
-    #C_initₙ = -C_init*tf.cast(C_init < 0, tf.float32) + tf.random.uniform((k,n,m), minval=0, maxval=jitter)
-    #p = tf.reshape(tf.math.reciprocal(tf.cast(tf.range(1,n) - n, tf.float32)), (1,n-1,1)) 
-    #ψₚ_init = tf.math.pow(C_initₚ[:,:-1], p)
-    #print(ψₚ_init[0,:,0], "init")
-    #ψₙ_init = tf.math.pow(C_initₙ[:,:-1], p)  
-    slide = tf.reshape(tf.math.reciprocal(tf.square(tf.cast(tf.range(n, 0, delta=-1), tf.float32))), (1,n,1))
-    C_init = tf.cast(tf.random.normal((k,n,m), stddev=init_stddev)*slide, tf.complex64)
-    p = tf.reshape(tf.math.reciprocal(tf.cast(tf.range(1,n) - n, tf.complex64)), (1,n-1,1)) 
-    ψ_init = tf.math.pow(C_init[:,:-1], p)
-    ψₚ_init =  ψ_init*tf.cast(ψ_init > 0, tf.float32) + tf.random.uniform((k,n-1,m), minval=0, maxval=jitter)
-    ψₙ_init = -ψ_init*tf.cast(ψ_init < 0, tf.float32) + tf.random.uniform((k,n-1,m), minval=0, maxval=jitter)
-    Cₚₙ_init = tf.random.normal((k,1,m))
-    Cₙₙ_init = tf.random.normal((k,1,m))
-    tf.debugging.check_numerics(ψₚ_init, message="ψₚ_init")
-    tf.debugging.check_numerics(ψₙ_init, message="ψₙ_init")
-    ψₚ = tf.Variable(ψₚ_init, name="ψp", constraint=tf.keras.constraints.NonNeg())
-    Cₚₙ = tf.Variable(Cₚₙ_init, name="Cpn", constraint=tf.keras.constraints.NonNeg())
-    ψₙ = tf.Variable(ψₙ_init, name="ψn", constraint=tf.keras.constraints.NonNeg())
-    Cₙₙ = tf.Variable(Cₙₙ_init, name="Cnn", constraint=tf.keras.constraints.NonNeg())
-    return (ψₚ,Cₚₙ,ψₙ,Cₙₙ), reciproot_C_constitute 
-  return params
-
-def reciproot_C_constitute(lnλ, λ, ψₚ,Cₚₙ,ψₙ,Cₙₙ):
-  #mₚ = tf.logical_and(tf.math.is_finite(ψ), ψ >= 0.0) 
-  #mₙ = tf.logical_and(tf.math.is_finite(ψ), ψ < 0.0)
-  Cʹ = σ(λ, ψₚ, Cₚₙ) - σ(λ, ψₙ, Cₙₙ)
-  tf.debugging.check_numerics(tf.math.real(Cʹ), message="Cʹ")
-  return Cʹ
-
-def relaxed_reciproot_C_param(init_gap = 2, init_stddev=0.1):
-  def params(n,m,k):
-    slide = tf.reshape(tf.math.reciprocal(tf.square(tf.cast(tf.range(n, 0, delta=-1), tf.float32))), (1,n,1))
-    C_init = tf.cast(tf.random.normal((k,n,m), stddev=init_stddev)*slide, tf.complex64)
-    p = tf.reshape(tf.math.reciprocal(tf.cast(tf.range(1,n) - n, tf.complex64)), (1,n-1,1)) 
-    ψ_init = tf.math.pow(C_init[:,:-1], p)
-    #print(ψ_init[0,:,0])
-
-    ψ_init_r = tf.reshape(tf.range(n-1, 0, -1, tf.float32), (1,n-1,1)) + tf.random.uniform((k,n-1,m), minval=-0.1, maxval=0.1)
-    ψ_init_i = tf.random.uniform((k,n-1,m), minval=-0.1, maxval=0.1)    
-
-    ψ_r = tf.Variable(ψ_init_r, name="ψ_r")
-    ψ_i = tf.Variable(ψ_init_i, name="ψ_i")
-    Cₙ = tf.Variable(tf.random.normal((k,1,m)), name="C_n")
-    return (ψ_r,ψ_i,Cₙ), relaxed_reciproot_C_constitute 
-  return params    
-
-def relaxed_reciproot_C_constitute(lnλ, λ, ψ_r, ψ_i, Cₙ):
-  ψ = tf.complex(ψ_r, ψ_i)   
-  Cʹ = σ(λ, ψ, Cₙ) 
-  #tf.debugging.check_numerics(tf.math.real(Cʹ), message="Cʹ")
-  return Cʹ
-
-# ψ : [k,n,m] is one of the halves
-# Cₙ : [k,1,m]
-def σ(λ, ψ, Cₙ):
-  k,n = λ.shape
-  ψ_ = tf.expand_dims(tf.cast(ψ, tf.complex64), -2) # [k, n-1, 1, m]  
-  #m_ = tf.expand_dims(tf.cast(m, tf.complex64), -2) # [k, n, 1, m]
-  λ_ = tf.reshape(λ, (k,1,n,1))
-  ψ·λ = ψ_ * λ_ # [k, n-1, n, m]. dim 1 indexed by p, 2 by j
-  p = tf.reshape(tf.cast(tf.range(1,n) - n, dtype=tf.complex64), (1,n-1,1,1))
-  ψ·λⁱ = tf.math.pow(ψ·λ, p) 
-  #tf.debugging.check_numerics(tf.math.real(ψ·λⁱ), message="ψ·λⁱ")
-  return tf.reduce_sum(ψ·λⁱ, axis=1) + tf.cast(Cₙ, tf.complex64)
+  return None, Cʹ
 
 def standard_D_param(D_init=None, Dₒ_init=None, useD=True):
-  def params(n,m,k):
+  def params(n,m,d):
     if useD:
       D = tf.Variable(
-          np.random.uniform(low=-0.001, high=0.001, size=[k,m]).astype(np.float32) / m if D_init is None else D_init,
+          np.random.uniform(low=-0.001, high=0.001, size=[d,m]).astype(np.float32) / m if D_init is None else D_init,
           name="D", dtype=tf.float32)
       Dₒ = tf.Variable(
           0.0 if Dₒ_init is None else Dₒ_init, 
           name="D0", dtype=tf.float32)  
     else:
-      D = tf.zeros((k,m), dtype=tf.float32)
+      D = tf.zeros((d,m), dtype=tf.float32)
       Dₒ = 0.0
     return (D, Dₒ), lambda D, Dₒ: (D,Dₒ)
   return params
 
+  
+# Batch of d SIMO LDS, only returning last state. Uses much more memory-efficient SparseLinearRecurrence op
+class SparseLDS(tf.keras.layers.Layer):
+  def __init__(self, n, m, AB_param, C_param, D_param, standard=False):
+    super(SparseLDS, self).__init__()
+    self.lnλ_λ_underlying, self.constitute_lnλ_λ = AB_param(n, m, k)
+    self.Cʹ_underlying, self.constitute_Cʹ = C_param(n, m, k)
+    self.D_Dₒ_underlying, self.constitute_D_Dₒ = D_param(n, m, k)
+    self.d = 1
+    self.n = n
+    self.m = m 
+    self.standard = standard
 
-# Takes [batch size, T, d] real
-# Returns [batch_size, T, m] real (in averaging mode)
-#      or [batch_size, T, d, m]   (with k=None)
+  def call(self, x):
+    b, T, d = x.shape
+    n = self.n
+    lnλ, λ = self.constitute_lnλ_λ(*self.lnλ_λ_underlying)
+    _, Cʹ = self.constitute_Cʹ(*((lnλ, λ) + self.Cʹ_underlying))
+    D, Dₒ = self.constitute_D_Dₒ(*self.D_Dₒ_underlying)
+    Bʹ = tf.ones([1,n], dtype=tf.complex64)
+
+    x = tf.complex(tf.transpose(x, (1,0,2)), 0.0)
+
+    # linear_recurrence computes sʹ_t = λ·sʹ_{t-1} + Bx_t
+    # for standard LDS, we need to shift x
+    # sʹ_t = λ·sʹ_{t-1} + Bx_{t-1}
+    if self.standard:
+      x = tf.concat([tf.zeros((1,b,d), dtype=tf.complex64),  x[:-1]], axis=0)
+    sₜʹ = sparse_linear_recurrence(λ, x, Bʹ) 
+    # sₜʹ: [b, 1, n]
+    # Cʹ: [1, n, m]    
+    # D : [1, m]
+    # [b, 1, n] * [1, n, m] -> [b, m]
+    Cʹ·sₜʹ = tf.matmul(tf.squeeze(sₜʹ), tf.squeeze(Cʹ))
+    D·xₜ = tf.matmul(x[-1], tf.complex(D, 0.0))
+    yₜ = Cʹ·sₜʹ + D·xₜ + tf.complex(Dₒ, 0.0)
+    
+    return tf.math.real(yₜ)
+
+  # TODO: (A, B, C, D) by computing elementary symmetric polynomials 
+  def canonical_lds():
+    return None
+
+'''
+A MIMO LDS in (perturbed) Luenberger canonical form
+n/d SIMO LDS, each of size d, with inputs coupled by a matrix E
+'''
+class LuenbergerLDS(tf.keras.layers.Layer):
+  def __init__(self, n, m, AB_param, C_param, D_param, E_init=None, last_only=False):
+    super(LuenbergerLDS, self).__init__()
+    self.n = n
+    self.m = m
+
+    # Optimization for sparse case
+    if last_only:
+      self.lds = SparseLDS(n, m, AB_param, C_param, D_param)
+    else:
+      self.lds = LuenbergerStack(n, self.m, 1, AB_param, C_param, D_param, last_only=last_only)
+    self.E = tf.keras.layers.Dense(use_bias=False, kernel_initializer=E_init)
+
+  def build(self, input_shape):
+    _, T, d = input_shape
+    if self.n % d != 0:
+      raise "n (LDS state size) must be divisible by d (input dimension)"  
+
+  def call(self, x):
+    E·x = self.E(x)
+    return self.lds(E·x)
+
+
+# Takes [b, T, d] real
+# Returns [b, T, m] real
 # Note: requires a fixed batch size. This means you must:
 # 1. Use an InputLayer in the Keras model specification. 
 # 2. Pass a TF dataset which has been batched with drop_remainder=True to model.fit(), 
 #    not a NumPy array. (Otherwise the last batch will be the wrong size.)
 class LDStack(tf.keras.layers.Layer):
   # n: state size
-  # d: input size
   # m: output size
-  # k: number of random projections (averaging mode)
   # Δ: depth of stack
   # standard: whether to compute 
   # last_only: return just the last element of the output sequence
-  def __init__(self, n, d, m, k=None, Δ=1, 
-               AB_param=randroot_AB_param(), 
-               C_param=reciproot_C_param(), 
-               D_param=standard_D_param(), 
-               standard=True, last_only=False, num_stacks=1):
+  def __init__(self, n, m, Δ, AB_param, C_param, D_param, 
+               𝒯_init=tf.keras.initializers.GlorotNormal(), 
+               W_init=tf.keras.initializers.GlorotNormal(),
+               ρ=tf.keras.activations.elu, 
+               mode='standard', 
+               last_only=False, 
+               relaxV=True,
+               r=1):
     super(LDStack, self).__init__()
-    self.n = n
-    self.m = m
-    self.k = k
-    self.Δ = Δ
     self.AB_param = AB_param
     self.C_param = C_param
     self.D_param = D_param
-    self.standard = standard
-    self.average = k is not None
-    self.last_only = last_only
-    self.num_stacks = num_stacks
-
-  def build(self, input_shape):
-    self.b, self.T, d = input_shape
-    n, m, k, Δ, standard, average, last_only, num_stacks = (self.n, self.m, self.k, self.Δ, self.standard, self.average, self.last_only, self.num_stacks) 
-
-    # Only perform random projection if number of projections is specified
-    # Otherwise, run SIMO LDS on each coordinate of original input
-    if average:
-      self.R = tf.Variable(np.random.normal(size=(d,k)), name="R", dtype=tf.float32, trainable=False)
-    else:
-      k = d
-
-    self.mid_layers = []
-    # Performance optimization for sparse, purely-linear case 
-    if Δ == 1 and num_stacks == 1 and last_only:
-      self.last_layer = SparseLDS(n, m, k, self.AB_param, self.C_param, self.D_param, average, standard)
-    else:
-      for i in np.arange(num_stacks-1):
-        self.mid_layers.append( LDStackInner(n, k, k, Δ, self.AB_param, self.C_param, self.D_param, average, standard) )
-      self.last_layer = LDStackInner(n, m, k, Δ, self.AB_param, self.C_param, self.D_param, average, standard, last_only=last_only)
-
-  def call(self, x):
-    if self.average:
-      x = tf.tensordot(x, self.R, [[-1], [0]])
-
-    x = tf.complex(tf.transpose(x, (1,0,2)), 0.0)
-    for layer in self.mid_layers:
-      x = layer(x)
-      x = tf.reshape(x, (self.T, self.b, -1))
-    y = tf.math.real(self.last_layer(x))
-
-    # Return to batch-major shape 
-    if self.last_only:
-      # time axis already eliminated when last state was taken
-      return y
-    else:
-      degree = len(y.shape)
-      return tf.transpose(y, (1,0,2,3)) if degree == 4 else tf.transpose(y, (1,0,2))
-
-
-# Average of k SIMO LDS, only returning last state. Uses much more memory-efficient SparseLinearRecurrence op
-class SparseLDS(tf.keras.layers.Layer):
-  def __init__(self, n, m, k, AB_param, C_param, D_param, average, standard=True):
-    super(SparseLDS, self).__init__()
-    self.lnλ_λ_underlying, self.constitute_lnλ_λ = AB_param(n, m, k)
-    self.Cʹ_underlying, self.constitute_Cʹ = C_param(n, m, k)
-    self.D_Dₒ_underlying, self.constitute_D_Dₒ = D_param(n, m, k)
-    self.k = k
+    self.𝒯_init = 𝒯_init
+    self.W_init = W_init
     self.n = n
     self.m = m 
-    self.average = average
-    self.standard = standard
-
-  def call(self, x):
-    T, b, k = x.shape
-    n = self.n
-    lnλ, λ = self.constitute_lnλ_λ(*self.lnλ_λ_underlying)
-    Cʹ = self.constitute_Cʹ(*((lnλ, λ) + self.Cʹ_underlying))
-    D, Dₒ = self.constitute_D_Dₒ(*self.D_Dₒ_underlying)
-    Bʹ = computeBʹ(lnλ, λ)
-
-    # linear_recurrence computes sʹ_t = λ·sʹ_{t-1} + Bx_t
-    # for standard LDS, we need to shift x
-    # sʹ_t = λ·sʹ_{t-1} + Bx_{t-1}
-    if self.standard:
-      x = tf.concat([tf.zeros((1,b,k), dtype=tf.complex64),  x[:-1]], axis=0)
-    # [b,k,n]
-    sₜʹ = sparse_linear_recurrence(λ, x, Bʹ) 
-    # sₜʹ: [b, k, n]
-    # Cʹ: [k, n, m]    
-    # [b, k, n, 1] * [1, k, n, m] -> [b, k, m]
-    Cʹ·sₜʹ = tf.reduce_sum(tf.expand_dims(sₜʹ, -1)*tf.expand_dims(Cʹ,0), axis=-2)
-    D·xₜ = tf.expand_dims(x[-1], -1) * tf.complex(tf.expand_dims(D, 0), 0.0)
-    yₜ = Cʹ·sₜʹ + D·xₜ + tf.complex(Dₒ, 0.0)
-    
-    if self.average:
-      yₜ = tf.reduce_mean(yₜ, axis=1) 
-    return yₜ
-
-  # TODO: (A, B, C, D) by computing elementary symmetric polynomials 
-  def canonical_lds():
-    return None
-
-# Full generality, but slower
-class LDStackInner(tf.keras.layers.Layer):
-  def __init__(self, n, m, k, Δ, AB_param, C_param, D_param, average, standard=True, last_only=False):
-    super(LDStackInner, self).__init__()
-    self.lnλ_λ_underlying, self.constitute_lnλ_λ = AB_param(n, m, k)
-    self.Cʹ_underlying, self.constitute_Cʹ = C_param(n, m, k)
-    self.D_Dₒ_underlying, self.constitute_D_Dₒ = D_param(n, m, k)
-    self.n = n
-    self.m = m 
-    self.k = k
     self.Δ = Δ
-    self.average = average
-    self.standard = standard
+    if mode != 'standard' and mode != 'adjoint' and mode != 'naive':
+      raise ValueError("mode must be standard, adjoint, or naive")
+    self.mode = mode
     self.last_only = last_only
+    self.relaxV = relaxV
+    # TODO: fuse for common activations
+    self.𝛿 = lambda a: ρ(a) - a
+    self.r = r    
+    self.lnλ_λ_underlying, self.constitute_lnλ_λ = self.AB_param(n, m, 1)
 
   def build(self, input_shape):
-    self.T, self.b, _ = input_shape 
+    _, _, self.d = input_shape
 
-  # x : [T, b, k]
-  # λ : [k, n]
-  # C : [k, m, n]
-  # D : [k, m]
-  # α : [T, b, k, n] is:
-  #      α_0, ..., α_{T-1} (in "standard" mode)
-  #      α_1, ..., α_T     (otherwise)
-  # Returns (for t in [1,...,T]):
-  # sʹ: [T, b, k, n] is:
-  #     sʹ_t = α_{t-1}·λ·sʹ_{t-1}  + Bx_{t-1}   (in "standard" mode)
-  #     sʹ_t = α_t    ·λ·sʹ_{t-1}  + Bx_t       (otherwise)
-  # currently with sʹ_0 = 0
-  # y : [T, b, k, m] is:
-  #     y_t  = Cʹsʹ_t + Dx_t
-  # y returned only if C, D, Dₒ are provided
+    # perhaps move to Luenberger? 
+    self.C_Cʹ_underlying, self.constitute_C_Cʹ = self.C_param(int(self.n/self.d), self.m, self.d)
+    self.D_Dₒ_underlying, self.constitute_D_Dₒ = self.D_param(self.n, self.m, self.d)
+    if self.d > 1:
+      self.E = tf.Variable(tf.random.normal((self.d,self.r), stddev=1/np.sqrt(self.n)), name="E", dtype=tf.float32, trainable=False)
 
-  def batch_simo_lds(self, x, lnλ, λ, Cʹ=None, D=None, Dₒ=None, α=None, standard=True):
-    k, n, m, T, b = (self.k, self.n, self.m, self.T, self.b)
-    states_only = Cʹ is None or D is None or Dₒ is None
-    Bʹ = computeBʹ(lnλ, λ)
+    if self.mode != 'naive':
+      if self.relaxV:
+        if self.d == 1:
+          self.W_r = tf.Variable(self.W_init((self.n, self.n)), dtype=tf.float32, name="W_r")
+          self.W_i = tf.Variable(tf.keras.initializers.Zeros()((self.n, self.n)), dtype=tf.float32, name="W_i") 
+        else:
+          self.W_r = tf.Variable(self.W_init((self.n, self.n, self.d)), dtype=tf.float32, name="W_r")
+          self.W_i = tf.Variable(tf.keras.initializers.Zeros()((self.n, self.n, self.d)), dtype=tf.float32, name="W_i")
+      else:
+        if self.d == 1:
+          self.𝒯_r = tf.Variable(self.𝒯_init((self.n, self.n)), dtype=tf.float32, name="T_r")
+          self.𝒯_i = tf.Variable(tf.keras.initializers.Zeros()((self.n, self.n)), dtype=tf.float32, name="T_i")        
+          #self.𝒯__ = tf.Variable(self.𝒯_init((self.n, self.n)), dtype=tf.float32, name="T")
+        # WEIRD: self.𝒯 and self.T are treated the same by Python
+        else:
+          self.𝒯_ = tf.Variable(self.𝒯_init((self.n, self.n, self.d)), dtype=tf.float32, name="T")
 
-    # Bʹ : [k, n]  
-    # Bʹ·x : [T, b, k*n]   
-    Bʹ·x = tf.reshape(tf.expand_dims(x, -1)*Bʹ, (T, b, k*n))
-    
-    # α·λ : [T, b, k*n]
-    # sʹ : [T, b, k, n]  
-    if α is None:
-      α·λ =  tf.tile(tf.reshape(λ, (1,1,-1)), (T, b, 1)) 
-    else:
-      α·λ = α*tf.reshape(λ, (1, 1, k, n))  
-      α·λ = tf.reshape(α·λ, (T, b, k*n))
-    # linear_recurrence computes sʹ_t = α_t·λ·sʹ_{t-1} + Bx_t
-    # for standard LDS, we need to shift α and x
-    # sʹ_t = α_{t-1}·λ·sʹ_{t-1} + Bx_{t-1}
-    if standard:
-      α·λ  = tf.concat([tf.zeros((1,b,k*n), dtype=tf.complex64),  α·λ[:-1]], axis=0)
-      Bʹ·x = tf.concat([tf.zeros((1,b,k*n), dtype=tf.complex64),  Bʹ·x[:-1]], axis=0)
-    sʹ = linear_recurrence(α·λ, Bʹ·x)
-    sʹ = tf.reshape(sʹ, [T, b, k, n])
-    if states_only:
-      return sʹ
-      
-    # sʹ : [T,b,k,n]
-    # Cʹ : [k,n,m] 
-    # [T,b,k,n,1] * [1,1,k,n,m] -> [T,b,k,m]
-    Cʹ·sʹ = tf.reduce_sum(tf.expand_dims(sʹ, -1)*tf.reshape(Cʹ, (1,1,k,n,m)), axis=-2)
-    D·x = tf.expand_dims(x, -1) * tf.complex(tf.reshape(D, (1,1,k,m)), 0.0)
-    y = Cʹ·sʹ + D·x + tf.complex(Dₒ, 0.0)
-
-    return sʹ, y
-
-  # x: [T, batch size, k] is complex (this is unusual, but matches the format of linear_recurrence.
-  #       And actually, is faster for GPU computation, and should be the standard for RNNs.)
-  # Returns complex output y of shape [T, batch size, m]
-  def call(self, x):
-    T, b, k = x.shape
-    n = self.n
-    lnλ, λ = self.constitute_lnλ_λ(*self.lnλ_λ_underlying)
-    Cʹ = self.constitute_Cʹ(*((lnλ, λ) + self.Cʹ_underlying))
-    D, Dₒ = self.constitute_D_Dₒ(*self.D_Dₒ_underlying)
-
-    # λ : [k, n]
-    # α : [T, b, k, n]
-    # sʹ: [T, b, k, n]
-    # y : [T, b, k, m]
-    α=None
-    for i in np.arange(self.Δ - 1):
-      sʹ = self.batch_simo_lds(x, lnλ, λ, α=α, standard=self.standard)
-      λ·sʹ = tf.reshape(λ, (1,1,k,n)) * sʹ
-      α = recipsq(λ·sʹ)
-    _, y = self.batch_simo_lds(x, lnλ, λ, Cʹ, D, Dₒ, α, self.standard)
-    if self.average:
-      y = tf.reduce_mean(y, axis=2)
-    if self.last_only:
-      y = y[-1]
-    return y
-
-
-# Careful computation of numerically unstable quantities
-def computeBʹ(lnλ, λ):
-  k, n = lnλ.shape
+  # sʹ = Vs in standard mode
+  # sʹ = V^{-H}s in adjoint mode
+  # sʹ : [T,b,n]
+  # λ  : [k,n]
+  def s_from_sʹ(self, sʹ, λ):
+    # FIXME: eliminate tiling
+    # FIXME: k and b
+    T,b,r,n = sʹ.shape
+    sʹ = tf.reshape(sʹ, (T,b*r,n))    
+    λ = tf.tile(λ, (sʹ.shape[1], 1))
+    if self.mode == 'standard':
+      s = sʹ
+      #s = vander_solve(λ, sʹ)
+      tf.debugging.check_numerics(tf.math.real(s), "after vander solve")
+    elif self.mode == 'adjoint':
+      s = vanderh_solve(λ, sʹ)
+    elif self.mode == 'naive':
+      s = sʹ
+    s = tf.reshape(s, (T,b,r,n))  
+    return tf.math.real(s)
+  def sʹ_from_s(self, s, λ):
+    s = tf.complex(s, 0.0)
+    T,b,r,n = s.shape
+    s = tf.reshape(s, (T,b*r,n))
+    # FIXME: eliminate tiling
+    λ = tf.tile(λ, (s.shape[1], 1))
+    if self.mode == 'standard':
+      sʹ = s
+      #sʹ = vander_mul(λ, s)
+    elif self.mode == 'adjoint':
+      sʹ = vanderh_mul(λ, s)
+    elif self.mode == 'naive':
+      sʹ = s
+    sʹ = tf.reshape(sʹ, (T,b,r,n))  
+    return sʹ
   
-  # ratios[k,i,j] = λi / λj for k'th λ
-  ratios = tf.reshape(λ, (k, -1, 1)) / tf.reshape(λ, (k, 1, -1))
-  #ln_ratios = tf.reshape(lnλ, (k, -1, 1)) - tf.reshape(lnλ, (k, 1, -1))
-  ratios = tf.linalg.set_diag(ratios, tf.zeros(shape=[k,n], dtype=tf.complex64))
+  def 𝒯j(self):
+    𝒯_ = tf.complex(self.𝒯_r, self.𝒯_i)[...,None] if self.d == 1 else self.𝒯_
+    # [1,1,r,d].[n,n,d,1]. -> [r,n,n]
+    𝒯E = tf.matmul(self.E[None,None,...], 𝒯_[...,None,:], transpose_a=True)[...,0] if self.d > 1 else 𝒯_
+    return tf.transpose(𝒯E, (2,0,1))
+  # h = s in naive mode 
+  # s = 𝒯h otherwise
+  def h_from_s(self, s, avg=False):
+    if self.mode == 'naive':
+      return s
+    else:
+      # FIXME: need linear system solving broadcasting
+      𝒯jinv = tf.linalg.inv(self.𝒯j())
+      # [1,1,r,n,n].[T,b,r,n,1] -> [T,b,r,n]
+      H = tf.matmul(𝒯jinv[None,None,...], s[...,None])[...,0]
+      return tf.reduce_mean(H, axis=-2) if avg else H
+  def s_from_h(self, h):
+    if self.mode == 'naive':
+      return h
+    else:
+      #[1,1,r,n,n].[T,b,r,n,1] -> [T,b,r,n]
+      return tf.matmul(self.𝒯j()[None,None,...],h[...,None])[...,0]
 
-  # Bʹ_i = λi^{n-1} / ∏_{i≠j} λi-λj
-  # log Bʹ_i 
-  # = (n-1) logλi - ∑_{i≠j} log(λi-λj)
-  # = (n-1) logλi - ∑_{i≠j} logλi + log(1 - λj/λi)
-  # = -∑_{i≠j} log(1 - λj/λi)
-  # = -∑_j log(1 - ratios[k,j,i]) 
-  # because log(1 - ratios[k,i,i]) = 0
-  lnBʹ = -1* tf.reduce_sum(tf.math.log1p(-ratios), axis=1)
+  def Wj(self):
+    W = tf.complex(self.W_r, self.W_i)[...,None] if self.d == 1 else tf.complex(self.W_r, self.W_i)
+    WE = tf.matmul(tf.complex(self.E[None,None,...], 0.0), W[...,None], transpose_a=True)[...,0] if self.d > 1 else W
+    return tf.transpose(WE, (2,0,1))
+  def direct_h_from_sʹ(self, sʹ, avg=False): 
+    # FIXME: need linear system solving broadcasting
+    Wjinv = tf.linalg.inv(self.Wj())
+    # [1,1,r,n,n].[T,b,r,n,1] -> [T,b,r,n]
+    H = tf.matmul(Wjinv[None,None,...], sʹ[...,None])[...,0]
+    h = tf.reduce_mean(H, axis=-2) if avg else H    
+    return tf.math.real(h)
+  def direct_sʹ_from_h(self, h):
+    return tf.matmul(self.Wj()[None,None,...],tf.complex(h[...,None], 0.0))[...,0]
+
+  # Bʹ = 1s in standard mode
+  # Bʹ_i = λi^{n-1} / ∏_{i≠j} λi-λj in adjoint mode
   # Bʹ : [k, n]
-  Bʹ = tf.exp(lnBʹ)
-  return Bʹ
+  def Bʹ(self, lnλ, λ):
+    if self.mode == 'standard':
+      return tf.ones_like(λ)
+    else:
+      k, n = lnλ.shape 
+      # ratios[k,i,j] = λi / λj for k'th λ
+      ratios = tf.reshape(λ, (k, -1, 1)) / tf.reshape(λ, (k, 1, -1))
+      ratios = tf.linalg.set_diag(ratios, tf.zeros(shape=[k,n], dtype=tf.complex64))
 
+      # log Bʹ_i 
+      # = (n-1) logλi - ∑_{i≠j} log(λi-λj)
+      # = (n-1) logλi - ∑_{i≠j} logλi + log(1 - λj/λi)
+      # = -∑_{i≠j} log(1 - λj/λi)
+      # = -∑_j log(1 - ratios[k,j,i]) 
+      # because log(1 - ratios[k,i,i]) = 0
+      lnBʹ = -1* tf.reduce_sum(tf.math.log1p(-ratios), axis=1)
+      Bʹ = tf.exp(lnBʹ)
+      return Bʹ
 
-# C is [k,n,m]. Returns [k,n,m]
-# in split form, where Cʹ = ψₚ - ψₘ  
-def computeCʹ(lnλ, λ, C, first_method=True): 
-  k,n = λ.shape
+  def corrections(self, sʹ, λ, x):
+    λ·sʹ_1x = sʹ * λ[0] + x[...,None]
+    if self.relaxV:
+      A̅h_B̅x = self.direct_h_from_sʹ(λ·sʹ_1x, avg=True)
+    else:
+      Ah_Bx = self.s_from_sʹ(λ·sʹ_1x, λ)
+      A̅h_B̅x = self.h_from_s(Ah_Bx, avg=True)
 
-  if True:
-    # Naive
-    p = tf.reshape(tf.cast(tf.range(1,n+1) - n, dtype=tf.complex64), (1,n,1,1))
-    λⁱ = tf.exp(p * tf.reshape(lnλ, (k,1,n,1))) # [k,n,n,1]
-    tf.debugging.check_numerics(tf.math.real(λⁱ), message="λⁱ")
-    C_ = tf.expand_dims(tf.cast(C, tf.complex64), -2) # [k, n, 1, m] 
-    Cʹ = tf.reduce_sum(C_*λⁱ, axis=2) # [k, n, m] 
-  elif first_method:
-    # Avoids taking log(C), but does need to take log(C·λⁱ)
-    λⁱ = tf.expand_dims(tf.math.pow(tf.expand_dims(λ, -1), tf.cast(tf.range(1,n+1), dtype=tf.complex64)), 0) # [1, k, n, n]  
-    tf.debugging.check_numerics(tf.math.real(λⁱ), message="λⁱ")
-    C = tf.expand_dims(tf.transpose(tf.cast(C, tf.complex64), (2,0,1)), 2) # [m, k, 1, n] 
-    C·λⁱ = tf.reduce_sum(C*λⁱ, axis=-1) # [m, k, n]  
-    Cʹ = tf.exp(tf.cast(-n, tf.complex64)*tf.expand_dims(lnλ, 0) + tf.math.log(C·λⁱ)) # [1,k,n]+[m,k,n]
-    Cʹ = tf.transpose(Cʹ, (1,2,0)) # [k, n, m]
-  else:
-    # Takes log(C)
-    lnC = tf.transpose(tf.math.log(tf.complex(C, 0.0)), (2,0,1)) # [m, k, n]
-    p = tf.cast(n - tf.range(1,n+1), tf.complex64)
-    lnU = tf.reshape(-1*p, (1,-1,1)) * tf.expand_dims(lnλ, 1) # [1,n,1]*[k,1,n] -> [k, n, n] 
-    lnC_lnU = tf.expand_dims(lnC,-1) + tf.expand_dims(lnU, 0) # [m,k,n,1]+[1,k,n,n] -> [m, k, n, n]
-    Cʹ = tf.reduce_sum(tf.exp(lnC_lnU), axis=-2) # [m, k, n]
-    Cʹ = tf.transpose(Cʹ, (1,2,0)) # [k, n, m] 
-  tf.debugging.check_numerics(tf.math.real(Cʹ), message="C'")
-  return Cʹ
+    # cʹ_t = 𝛿(A̅h_t + B̅x_t)
+    # linear_recurrence computes sʹ_t = λ·sʹ_{t-1} + 1x_t + cʹ_t
+    # Suppose cʹ_t for t  = {0,...,T-1} in code is actually cʹ_t for t  = {1,...,T} in math
+    # sʹ_t for t = {0,...,T-1} in code is actually sʹ_{t+1} for t = {1, ... ,T} in math
+    # In math, for t = {1,...,T}
+    #   h_{t+1} = Ah_t + Bx_t + c_t
+    #   Ah_t + Bx_t = h_{t+1} - c_t
+    # Corresponding to code, for t = {1,...,T}:
+    #   h_t - c_t
+    #A̅h_B̅x = h - (c if c is not None else 0.0)
+    k = self.𝛿(A̅h_B̅x)
+    #print(
+    #  tf.reduce_mean(tf.linalg.norm(λ·sʹ_1x, axis=-1)),
+    #  tf.reduce_mean(tf.linalg.norm(A̅h_B̅x, axis=-1)), 
+    #  tf.reduce_mean(tf.linalg.norm(k, axis=-1)), "corrections")    
+    #tf.debugging.check_numerics(k, "corrections")
+    # [T,b,n] -> [T,b,r,n]
+    if self.relaxV:
+      kʹ = self.direct_sʹ_from_h(k[...,None,:])
+    else:
+      kʹ = self.sʹ_from_s(self.s_from_h(k[...,None,:]), λ)
+    return kʹ
 
+  # x: [b, T, d] if not time_major, else [T, b, d] 
+  # linear_recurrence computes sʹ_t = λ·sʹ_{t-1} + Bʹx_t + cʹ_t
+  # currently with Sʹ_0 = 0  
+  # Suppose cʹ_t for t  = {0,...,T-1} in code is actually cʹ_t for t  = {1,...,T} in math
+  # sʹ_t for t = {0,...,T-1} in code is actually sʹ_{t+1} for t = {1, ... ,T} in math
+  def call(self, x):
+    b,T,_ = x.shape
+    # TODO: eliminate wasteful transpose
+    x = tf.transpose(x, (1,0,2))
 
+    if self.mode != 'naive' and self.d > 1:
+      # [T,b,1,d].[1,1,d,r] -> [T,b,r]
+      E·x = tf.complex(tf.matmul(x[...,None,:], self.E[None,None,...], ), 0.0)[...,0,:]
+    else:
+      E·x = tf.complex(x, 0.0)
+
+    d, n, m = (self.d, self.n, self.m)
+    lnλ, λ = self.constitute_lnλ_λ(*self.lnλ_λ_underlying)
+    C, Cʹ = self.constitute_C_Cʹ(*((lnλ, λ) + self.C_Cʹ_underlying))
+    D, Dₒ = self.constitute_D_Dₒ(*self.D_Dₒ_underlying)
+    Bʹ = self.Bʹ(lnλ, λ)
+
+    # λ  : [1, n]
+    # kʹ : [T, b, n] // [T, b, r, n]
+    # sʹ : [T, b, n] // [T, b, r, n]
+    # y  : [T, b, m] // [T, b, m]
+    kʹ=None
+    for i in np.arange(self.Δ):
+      sʹ = self.run_simo_lds(E·x, lnλ, λ, Bʹ, kʹ) # [T, b, r, n]
+      tf.debugging.check_numerics(tf.math.real(sʹ), "SIMO LDS")
+      if i < self.Δ - 1:
+        kʹ = self.corrections(sʹ, λ, E·x)
+    
+    # h : [T, b, n]
+    # Cʹ : [d, n/d, m] ?? [n, m]
+    # D  : [d, m] 
+    # [T, b, n, 1] * [1, 1, n, m] -> [T, b, m]
+    if self.last_only:
+      sʹ = sʹ[None,-1]
+      x = x[None,-1]
+
+    if C is not None:
+      # [T, b, n]
+      if self.relaxV:
+        h = self.direct_h_from_sʹ(sʹ, avg=True)
+      else: 
+        h = self.h_from_s(self.s_from_sʹ(sʹ, λ), avg=True)
+      C = tf.reshape(C, (n, m))
+      # [T,b,1,n].[1,1,n,m] -> [T,b,m]
+      C·h = tf.matmul(h[...,None,:], C[None,None,...])[...,0,:]  
+    else:
+      sʹ = tf.reduce_mean(sʹ, axis=-2)
+      Cʹ = tf.reshape(Cʹ, (n, m))
+      # [T,b,1,n].[1,1,n,m] -> [T,b,m]
+      C·h = tf.math.real(tf.matmul(sʹ[...,None,:], Cʹ[None,None,...])[...,0,:]) 
+
+    D·x = tf.tensordot(x, D, [[-1], [0]])
+    y = C·h + D·x + Dₒ
+
+    # Return to batch-major shape
+    return y[0] if self.last_only else tf.transpose(y, (1,0,2))
+
+  # x : [T, b, r]
+  # λ : [1, n]
+  # kʹ : [T, b, r, n] 
+  def run_simo_lds(self, x, lnλ, λ, Bʹ, kʹ=None):
+    r, n, m = (self.r, self.n, self.m)
+    T,b,_ = x.shape
+
+    # x_kʹ : [T, b, r*n] 
+    x_kʹ = tf.repeat(x, n, -1)
+    if kʹ is not None:
+      x_kʹ += tf.reshape(kʹ, (T,b,r*n))   
+
+    # TODO: replace tiling with more efficient op
+    # λ : [T, b, r*n]
+    λ = tf.tile(tf.reshape(λ, (1,1,-1)), (T, b, r)) 
+    
+    # sʹ : [T, b, r*n] to [T, b, r, n]
+    sʹ = linear_recurrence(λ, x_kʹ)
+    sʹ = tf.reshape(sʹ, (T,b,r,n))
+    return sʹ
+
+class LuenbergerStack(LDStack):
+  def __init__(self, n, m, Δ, AB_param, C_param, D_param, 
+               E_init=tf.keras.initializers.GlorotNormal(), 
+               𝒯_init=tf.keras.initializers.Identity(), 
+               mode='standard', 
+               ρ=tf.keras.activations.elu, 
+               last_only=False):
+    super(LuenbergerStack, self).__init__(n, m, Δ, AB_param, C_param, D_param, 𝒯_init, ρ, mode, last_only)
+    self.E_init = E_init
+    
+  def build(self, input_shape):
+    super().build(input_shape)
+    n_d = int(self.n/self.d)
+    if self.n % self.d != 0:
+      raise "n (LDS state size) must be divisible by d (input dimension)"
+    self.lnλ_λ_underlying, self.constitute_lnλ_λ = self.AB_param(n_d, self.m, self.d)
+    if self.d > 1:
+      self.E = tf.Variable(self.E_init(shape=(self.d,self.d)), name="E", dtype=tf.float32)
+    else:
+      self.E = tf.ones((1,1), dtype=tf.float32)  
 
 # Reciprocal square root nonlinearity
 def recipsq(a):
 #  return tf.complex(tf.math.rsqrt(1 + tf.math.square(tf.abs(a))), 0.0)
   return tf.math.rsqrt(1 + a*tf.math.conj(a))
+
+# For 𝒯_init
+def random_controllability_matrix(shape):
+  n = shape[0]
+  A = np.random.normal(size=(n,n))
+  B = np.random.normal(size=(n,1))
+  return controllability_matrix((A,B))[0]
